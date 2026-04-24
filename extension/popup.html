@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>matata</title>
+  <style>
+    body  { font-family: system-ui, sans-serif; font-size: 13px; margin: 12px; width: 340px; }
+    h1    { font-size: 14px; margin: 0 0 8px 0; }
+    fieldset { border: 1px solid #ddd; padding: 8px; margin: 0 0 8px 0; }
+    legend   { padding: 0 4px; color: #666; }
+    label  { display: block; margin: 6px 0 2px 0; }
+    input[type=text], input[type=number], textarea {
+      width: 100%; box-sizing: border-box; font: inherit;
+    }
+    textarea { height: 60px; resize: vertical; }
+    button   { padding: 4px 10px; font: inherit; cursor: pointer; }
+    .row     { display: flex; gap: 6px; align-items: center; }
+    .muted   { color: #888; font-size: 12px; }
+    .ok      { color: #1a7f1a; }
+    .err     { color: #b30000; }
+    #status  { min-height: 16px; margin-top: 6px; }
+    .job-row { padding: 4px 0; border-bottom: 1px dotted #eee; }
+    .job-row:last-child { border-bottom: none; }
+    .job-url { font-family: monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .job-meta { font-size: 11px; color: #666; margin-top: 2px; }
+    .job-bar { height: 4px; background: #eee; border-radius: 2px; overflow: hidden; margin-top: 2px; }
+    .job-fill { height: 100%; background: #1a7f1a; transition: width 200ms linear; }
+    .status-running { color: #1a57c9; }
+    .status-done    { color: #1a7f1a; }
+    .status-err     { color: #b30000; }
+    .sniff-row { display: flex; gap: 6px; align-items: center; padding: 3px 0; border-bottom: 1px dotted #eee; }
+    .sniff-row:last-child { border-bottom: none; }
+    .sniff-kind { background: #e8f0fe; color: #1a57c9; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .sniff-url  { flex: 1; font-family: monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+<h1>matata download helper</h1>
+
+<fieldset>
+  <legend>Interceptor</legend>
+  <label><input type="checkbox" id="enabled"> hand matching downloads to matata</label>
+  <label>minimum size (bytes, 0 = any): <input type="number" id="minSize" min="0" step="1"></label>
+  <label>extensions (comma-separated):</label>
+  <textarea id="extensions" placeholder="zip,exe,mp4,..."></textarea>
+  <label>output directory (blank = Downloads):</label>
+  <input type="text" id="outDir" placeholder="C:\Users\me\Downloads\matata">
+  <div class="row"><button id="save">save</button><span id="saveStatus" class="muted"></span></div>
+</fieldset>
+
+<fieldset>
+  <legend>Active downloads</legend>
+  <div id="jobList" class="muted">(none)</div>
+</fieldset>
+
+<fieldset>
+  <legend>Streams on this tab</legend>
+  <div id="sniffList" class="muted">(none detected yet)</div>
+</fieldset>
+
+<fieldset>
+  <legend>Manual download</legend>
+  <label>URL:</label>
+  <input type="text" id="mUrl" placeholder="https://...">
+  <label>filename (optional):</label>
+  <input type="text" id="mName">
+  <div class="row"><button id="send">send to matata</button></div>
+</fieldset>
+
+<fieldset>
+  <legend>Diagnostics</legend>
+  <div class="row"><button id="ping">ping native host</button><span id="status" class="muted"></span></div>
+</fieldset>
+
+<script src="popup.js"></script>
+</body>
+</html>

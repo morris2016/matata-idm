@@ -1,0 +1,26 @@
+# GitHub Pages (Jekyll) config for the matata site at
+# https://<user>.github.io/matata/
+
+title:       matata
+description: A Windows download manager. IDM-style, free, open source.
+theme:       jekyll-theme-cayman
+
+# Pretty URLs (/privacy instead of /privacy.html).
+permalink:   pretty
+
+# Don't bother building the README that sits at the repo root if
+# someone's Pages source is the whole repo -- we only want /docs.
+exclude:
+  - README.md
+  - build.bat
+  - pack-extension.ps1
+  - installer/
+  - shell-ext/
+  - native-host/
+  - extension/
+  - src/
+  - include/
+  - build/
+
+kramdown:
+  input: GFM

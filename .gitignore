@@ -1,0 +1,11 @@
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.mtpart
+*.mtmeta
+.vs/
+native-host/com.matata.host.json

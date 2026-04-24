@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "matata download helper",
+  "short_name": "matata",
+  "version": "0.7.1",
+  "description": "Send Chrome downloads to matata — fast segmented downloads with resume, HLS / DASH capture, and a clean queue.",
+  "minimum_chrome_version": "109",
+
+  "icons": {
+    "16":  "icons/icon-16.png",
+    "32":  "icons/icon-32.png",
+    "48":  "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+
+  "permissions": [
+    "downloads",
+    "storage",
+    "cookies",
+    "nativeMessaging",
+    "webRequest",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_title": "matata",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+
+  "options_ui": {
+    "page": "popup.html",
+    "open_in_tab": true
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "matata@matata.local",
+      "strict_min_version": "109.0"
+    }
+  }
+}
