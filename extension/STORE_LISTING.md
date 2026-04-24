@@ -11,7 +11,10 @@ Paste these straight into the developer dashboard submission form.
 `Fast segmented downloads, HLS/DASH capture, and a clean queue — routed to the native matata app.`
 
 ## Category
-`Productivity`
+`Workflow & Planning`
+(Chrome Web Store's current taxonomy — replaces the older "Productivity".
+If the dashboard still shows "Productivity" in some regions, that's the
+same bucket.)
 
 ## Language
 `English`
