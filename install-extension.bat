@@ -48,16 +48,32 @@ rem Escape backslashes for JSON.
 set ESCAPED_PATH=%HOST_EXE:\=\\%
 
 rem --- Chromium-family manifest (allowed_origins) ---
-> "%HOST_JSON%" (
-    echo {
-    echo   "name": "com.matata.host",
-    echo   "description": "matata download helper native host",
-    echo   "path": "%ESCAPED_PATH%",
-    echo   "type": "stdio",
-    echo   "allowed_origins": [
-    echo     "chrome-extension://%EXTID%/"
-    echo   ]
-    echo }
+rem When EDGE_ID is empty, ship one entry; when set, ship both.
+if "%EDGE_ID%"=="" (
+    > "%HOST_JSON%" (
+        echo {
+        echo   "name": "com.matata.host",
+        echo   "description": "matata download helper native host",
+        echo   "path": "%ESCAPED_PATH%",
+        echo   "type": "stdio",
+        echo   "allowed_origins": [
+        echo     "chrome-extension://%CHROME_ID%/"
+        echo   ]
+        echo }
+    )
+) else (
+    > "%HOST_JSON%" (
+        echo {
+        echo   "name": "com.matata.host",
+        echo   "description": "matata download helper native host",
+        echo   "path": "%ESCAPED_PATH%",
+        echo   "type": "stdio",
+        echo   "allowed_origins": [
+        echo     "chrome-extension://%CHROME_ID%/",
+        echo     "chrome-extension://%EDGE_ID%/"
+        echo   ]
+        echo }
+    )
 )
 
 rem --- Firefox manifest (allowed_extensions) ---
@@ -83,8 +99,9 @@ echo [install] registered com.matata.host for Chrome, Edge, Chromium, Firefox.
 echo [install] chrome manifest:  %HOST_JSON%
 echo [install] firefox manifest: %HOST_JSON_FF%
 echo [install] host exe:         %HOST_EXE%
-echo [install] chromium ext id:  %EXTID%
-echo [install] firefox ext id:   %FF_EXT_ID%
+echo [install] chrome ext id:   %CHROME_ID%
+if not "%EDGE_ID%"=="" echo [install] edge ext id:     %EDGE_ID%
+echo [install] firefox ext id:  %FF_EXT_ID%
 echo.
 echo Restart the browser (fully quit, not just close the window) so the new
 echo native messaging host is picked up, then reload the extension.
