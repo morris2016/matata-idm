@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>matata — confirm download</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      margin: 0;
+      padding: 14px 16px 12px 16px;
+      background: #fafafa;
+      color: #222;
+    }
+    @media (prefers-color-scheme: dark) {
+      body  { background: #1e1e1e; color: #e8e8e8; }
+      .box  { background: #2a2a2a; border-color: #444; }
+      .muted { color: #aaa; }
+      .url, .path { background: #1a1a1a; }
+    }
+    h1 { font-size: 14px; margin: 0 0 10px 0; font-weight: 600; }
+    .box {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+    }
+    .row { display: flex; gap: 8px; margin-bottom: 6px; align-items: baseline; }
+    .row:last-child { margin-bottom: 0; }
+    .label {
+      width: 72px;
+      flex-shrink: 0;
+      font-weight: 600;
+      color: #555;
+    }
+    .value { flex: 1; min-width: 0; word-break: break-all; }
+    .url, .path {
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      background: #f2f2f2;
+      padding: 2px 5px;
+      border-radius: 3px;
+    }
+    .muted { color: #888; font-size: 12px; }
+    .buttons {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+      margin-top: 10px;
+    }
+    button {
+      padding: 6px 14px;
+      font: inherit;
+      cursor: pointer;
+      border: 1px solid #bbb;
+      border-radius: 3px;
+      background: #f0f0f0;
+    }
+    button.primary {
+      background: #1a57c9;
+      color: #fff;
+      border-color: #1a57c9;
+      font-weight: 600;
+    }
+    button.primary:hover { background: #1649a8; }
+    button:hover:not(.primary) { background: #e4e4e4; }
+    .option-row {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #666;
+    }
+    .option-row input[type=checkbox] { vertical-align: middle; }
+  </style>
+</head>
+<body>
+
+<h1>Download with matata?</h1>
+
+<div class="box">
+  <div class="row"><div class="label">File</div><div class="value" id="filename">—</div></div>
+  <div class="row"><div class="label">Size</div><div class="value" id="size">—</div></div>
+  <div class="row"><div class="label">URL</div><div class="value url" id="url">—</div></div>
+  <div class="row"><div class="label">From</div><div class="value url" id="referer">—</div></div>
+  <div class="row"><div class="label">Save to</div><div class="value path" id="outDir">Downloads</div></div>
+</div>
+
+<div class="option-row">
+  <label><input type="checkbox" id="dontAskExt"> don't ask again for <span id="extLabel">this type</span></label>
+</div>
+
+<div class="buttons">
+  <button id="btnCancel">Cancel</button>
+  <button id="btnLater">Download later</button>
+  <button id="btnStart" class="primary" autofocus>Start download</button>
+</div>
+
+<script src="confirm.js"></script>
+</body>
+</html>

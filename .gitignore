@@ -9,3 +9,6 @@ build/
 *.mtmeta
 .vs/
 native-host/com.matata.host.json
+native-host/com.matata.host.firefox.json
+# Fetched on demand by fetch-webview2.ps1 / fetch-ffmpeg.ps1 / fetch-yt-dlp.ps1.
+third-party/

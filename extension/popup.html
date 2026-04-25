@@ -41,17 +41,30 @@
 <fieldset>
   <legend>Interceptor</legend>
   <label><input type="checkbox" id="enabled"> hand matching downloads to matata</label>
+  <label><input type="checkbox" id="confirmEach"> confirm each download (IDM-style popup)</label>
   <label>minimum size (bytes, 0 = any): <input type="number" id="minSize" min="0" step="1"></label>
   <label>extensions (comma-separated):</label>
   <textarea id="extensions" placeholder="zip,exe,mp4,..."></textarea>
   <label>output directory (blank = Downloads):</label>
   <input type="text" id="outDir" placeholder="C:\Users\me\Downloads\matata">
+  <label>don't ask for these extensions (comma-separated):</label>
+  <textarea id="skipExts" placeholder="(empty)"></textarea>
   <div class="row"><button id="save">save</button><span id="saveStatus" class="muted"></span></div>
 </fieldset>
 
 <fieldset>
   <legend>Active downloads</legend>
   <div id="jobList" class="muted">(none)</div>
+</fieldset>
+
+<fieldset id="ytPanel" style="display:none">
+  <legend>Video on this page</legend>
+  <div id="ytTitle"  class="muted" style="margin-bottom:4px"></div>
+  <div class="row" style="gap:6px">
+    <select id="ytQuality" style="flex:1"></select>
+    <button id="ytGrab">grab</button>
+  </div>
+  <div id="ytStatus" class="muted" style="margin-top:4px"></div>
 </fieldset>
 
 <fieldset>

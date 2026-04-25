@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "matata download helper",
   "short_name": "matata",
-  "version": "0.7.1",
+  "version": "0.9.3",
   "description": "Send Chrome downloads to matata — fast segmented downloads with resume, HLS / DASH capture, and a clean queue.",
   "minimum_chrome_version": "109",
 
@@ -19,7 +19,8 @@
     "cookies",
     "nativeMessaging",
     "webRequest",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -29,6 +30,34 @@
     "service_worker": "background.js",
     "scripts": ["background.js"]
   },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.youtube.com/*",
+        "*://m.youtube.com/*",
+        "*://music.youtube.com/*",
+        "*://player.vimeo.com/*",
+        "*://vimeo.com/*"
+      ],
+      "js": ["yt-extract.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "exclude_matches": [
+        "*://www.youtube.com/*",
+        "*://m.youtube.com/*",
+        "*://music.youtube.com/*",
+        "*://player.vimeo.com/*",
+        "*://vimeo.com/*"
+      ],
+      "js": ["sniff-overlay.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
 
   "action": {
     "default_title": "matata",
@@ -47,7 +76,10 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "matata@matata.local",
-      "strict_min_version": "109.0"
+      "strict_min_version": "109.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   }
 }

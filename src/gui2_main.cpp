@@ -1,0 +1,2155 @@
+// matata-gui.exe — WebView2-based GUI shell.
+//
+// The window hosts a single WebView2 control filling the client area; all
+// rendering is HTML/CSS in ui/. Communication is JSON over
+// chrome.webview.postMessage (JS → C++) and ExecuteScriptAsync (C++ → JS).
+// The C++ side keeps the Downloader / VideoGrabber / FtpDownloader workers,
+// owns the filesystem state, and persists settings to HKCU.
+
+#define NOMINMAX
+#define _WIN32_WINNT 0x0A00
+
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+
+#include <wrl/client.h>
+#include <wrl/event.h>
+#include <wrl/implements.h>
+
+#include "WebView2.h"
+
+#include "matata/downloader.hpp"
+#include "matata/ftp_downloader.hpp"
+#include "matata/hls.hpp"
+#include "matata/dash.hpp"
+#include "matata/video.hpp"
+#include "matata/url.hpp"
+#include "matata/updater.hpp"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cwchar>
+#include <ctime>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace matata;
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Callback;
+using Microsoft::WRL::Make;
+
+namespace {
+
+// ---- constants -------------------------------------------------------
+
+constexpr wchar_t kClassName[]    = L"MatataMainWnd"; // SAME as legacy GUI so the extension's WM_COPYDATA finds us.
+constexpr wchar_t kAppTitle[]     = L"matata";
+constexpr wchar_t kInstanceMutex[]= L"Local\\com.matata.gui.singleton";
+constexpr wchar_t kVirtualHost[]  = L"matata.local";
+constexpr ULONG_PTR kHandoffMagic = 0x4D415441; // 'MATA' — matches legacy.
+
+constexpr UINT WM_APP_BRIDGE_EVENT  = WM_APP + 10; // post JSON to UI
+constexpr UINT WM_APP_PROGRESS      = WM_APP + 11; // worker progress
+constexpr UINT WM_APP_COMPLETED     = WM_APP + 12; // worker done
+constexpr UINT WM_APP_UPDATE_AVAIL  = WM_APP + 13; // background update check found newer version
+
+// Update manifest published at the project's GitHub Pages site. Schema:
+//   { "version": "0.9.4", "url": "https://.../matata-0.9.4-setup.exe",
+//     "notes":   "What's new in 0.9.4..." }
+// Bumping the file there triggers the in-app prompt on next launch.
+constexpr const wchar_t* kUpdateManifestUrl =
+    L"https://morris2016.github.io/matata-idm/latest.json";
+
+// ---- globals ---------------------------------------------------------
+
+HINSTANCE g_hInst   = nullptr;
+HWND      g_hwnd    = nullptr;
+HANDLE    g_instanceMutex = nullptr;
+
+ComPtr<ICoreWebView2Controller> g_controller;
+ComPtr<ICoreWebView2>           g_webview;
+bool g_webviewReady = false;
+std::vector<std::wstring> g_pendingScripts; // sent before webview was ready
+
+// ---- diagnostic log (~/AppData/Local/Temp/matata-gui.log) -------------
+
+void dbgLog(const wchar_t* fmt, ...) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, path);
+    if (n == 0 || n >= MAX_PATH) return;
+    wcscat_s(path, MAX_PATH, L"matata-gui.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t pre[64];
+    _snwprintf_s(pre, _TRUNCATE, L"[%02d:%02d:%02d.%03d pid=%lu] ",
+                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                 GetCurrentProcessId());
+    wchar_t body[4096];
+    va_list ap; va_start(ap, fmt);
+    int len = _vsnwprintf_s(body, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (len < 0) len = 0;
+    std::wstring line = pre;
+    line += body;
+    line += L"\r\n";
+    int u8 = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(),
+                                 nullptr, 0, nullptr, nullptr);
+    std::string utf8(u8, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(),
+                        utf8.data(), u8, nullptr, nullptr);
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    DWORD w = 0;
+    WriteFile(h, utf8.data(), (DWORD)utf8.size(), &w, nullptr);
+    CloseHandle(h);
+}
+
+// ---- handoff (compatible with legacy gui_main.cpp + extension) -------
+
+struct HandoffSpec {
+    std::wstring url;
+    std::wstring filename;
+    std::wstring outDir;
+    std::wstring referer;
+    std::wstring cookie;
+    std::wstring userAgent;
+    std::wstring ytFormat;     // yt-dlp -f selector (e.g. "bv*[height=1080]+ba/b")
+    std::wstring cookiesPath;  // path to a Netscape cookies.txt the host wrote
+};
+
+std::wstring serializeHandoff(const HandoffSpec& s) {
+    std::wstring out;
+    auto put = [&](const wchar_t* k, const std::wstring& v) {
+        if (v.empty()) return;
+        out.append(k); out.push_back(L'\0');
+        out.append(v); out.push_back(L'\0');
+    };
+    put(L"url",       s.url);
+    put(L"filename",  s.filename);
+    put(L"outDir",    s.outDir);
+    put(L"referer",   s.referer);
+    put(L"cookie",    s.cookie);
+    put(L"userAgent", s.userAgent);
+    put(L"ytFormat",  s.ytFormat);
+    put(L"cookiesPath", s.cookiesPath);
+    return out;
+}
+
+HandoffSpec deserializeHandoff(const wchar_t* data, size_t count) {
+    HandoffSpec s;
+    size_t i = 0;
+    auto readField = [&](std::wstring& out) -> bool {
+        size_t start = i;
+        while (i < count && data[i] != L'\0') ++i;
+        if (i >= count) return false;
+        out.assign(data + start, i - start);
+        ++i;
+        return true;
+    };
+    while (i < count) {
+        std::wstring key, val;
+        if (!readField(key)) break;
+        if (!readField(val)) break;
+        if      (key == L"url")       s.url = std::move(val);
+        else if (key == L"filename")  s.filename = std::move(val);
+        else if (key == L"outDir")    s.outDir = std::move(val);
+        else if (key == L"referer")   s.referer = std::move(val);
+        else if (key == L"cookie")    s.cookie = std::move(val);
+        else if (key == L"userAgent") s.userAgent = std::move(val);
+        else if (key == L"ytFormat")  s.ytFormat = std::move(val);
+        else if (key == L"cookiesPath") s.cookiesPath = std::move(val);
+    }
+    return s;
+}
+
+bool parseHandoffArgs(PWSTR cmdLine, HandoffSpec& out) {
+    if (!cmdLine || !*cmdLine) return false;
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(cmdLine, &argc);
+    if (!argv) return false;
+    auto next = [&](int& i, std::wstring& dst) {
+        if (i + 1 < argc) dst = argv[++i];
+    };
+    for (int i = 0; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if      (a == L"--add-url")    next(i, out.url);
+        else if (a == L"--filename")   next(i, out.filename);
+        else if (a == L"--out-dir")    next(i, out.outDir);
+        else if (a == L"--referer")    next(i, out.referer);
+        else if (a == L"--cookie")     next(i, out.cookie);
+        else if (a == L"--user-agent") next(i, out.userAgent);
+        else if (a == L"--yt-format")  next(i, out.ytFormat);
+        else if (a == L"--cookies-file") next(i, out.cookiesPath);
+        else if (out.url.empty()) {
+            if (a.size() > 9 && a.compare(0, 9, L"matata://") == 0) out.url = a.substr(9);
+            else if (a.compare(0, 7, L"http://")  == 0 ||
+                     a.compare(0, 8, L"https://") == 0 ||
+                     a.compare(0, 6, L"ftp://")   == 0 ||
+                     a.compare(0, 7, L"ftps://")  == 0) out.url = a;
+        }
+    }
+    LocalFree(argv);
+    auto trim = [](std::wstring& s) {
+        while (!s.empty() && (s.front() == L'"' || s.front() == L' ')) s.erase(s.begin());
+        while (!s.empty() && (s.back()  == L'"' || s.back()  == L' ')) s.pop_back();
+    };
+    trim(out.url); trim(out.filename); trim(out.outDir);
+    trim(out.referer); trim(out.cookie); trim(out.userAgent); trim(out.ytFormat); trim(out.cookiesPath);
+    return !out.url.empty();
+}
+
+bool forwardHandoffToExistingInstance(const HandoffSpec& spec) {
+    HWND target = FindWindowW(kClassName, nullptr);
+    if (!target) return false;
+    std::wstring blob = serializeHandoff(spec);
+    COPYDATASTRUCT cds{};
+    cds.dwData = kHandoffMagic;
+    cds.cbData = (DWORD)(blob.size() * sizeof(wchar_t));
+    cds.lpData = (PVOID)blob.data();
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    ShowWindow(target, SW_SHOW);
+    SetForegroundWindow(target);
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(target, WM_COPYDATA, 0, (LPARAM)&cds,
+                        SMTO_ABORTIFHUNG, 5000, &result);
+    return true;
+}
+
+// ---- settings (HKCU) -------------------------------------------------
+
+struct Settings {
+    std::wstring outputDir;
+    int          connections     = 8;
+    int          maxJobs         = 3;
+    int64_t      bandwidthBps    = 0;
+    bool         clipboardWatch  = false;
+    bool         verifyChecksum  = true;
+    bool         categorize      = false;
+    int          windowX = CW_USEDEFAULT, windowY = CW_USEDEFAULT;
+    int          windowW = 1180, windowH = 760;
+    bool         windowMaximized = false;
+};
+
+Settings g_settings;
+
+void loadSettings() {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\matata", 0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return;
+    auto rdString = [&](const wchar_t* name, std::wstring& out) {
+        DWORD type = 0, cb = 0;
+        if (RegQueryValueExW(hk, name, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS) return;
+        if (type != REG_SZ || cb == 0) return;
+        out.resize(cb / sizeof(wchar_t));
+        RegQueryValueExW(hk, name, nullptr, nullptr, (LPBYTE)out.data(), &cb);
+        if (!out.empty() && out.back() == L'\0') out.pop_back();
+    };
+    auto rdDword = [&](const wchar_t* name, DWORD& out) {
+        DWORD type = 0, cb = sizeof(out);
+        RegQueryValueExW(hk, name, nullptr, &type, (LPBYTE)&out, &cb);
+    };
+    auto rdQword = [&](const wchar_t* name, int64_t& out) {
+        DWORD type = 0, cb = sizeof(out);
+        RegQueryValueExW(hk, name, nullptr, &type, (LPBYTE)&out, &cb);
+    };
+    rdString(L"outputDir", g_settings.outputDir);
+    DWORD d;
+    d = (DWORD)g_settings.connections;     rdDword(L"connections",     d); g_settings.connections = (int)d;
+    d = (DWORD)g_settings.maxJobs;         rdDword(L"maxJobs",         d); g_settings.maxJobs     = (int)d;
+    rdQword(L"bandwidthBps", g_settings.bandwidthBps);
+    d = g_settings.clipboardWatch ? 1 : 0; rdDword(L"clipboardWatch",  d); g_settings.clipboardWatch  = (d != 0);
+    d = g_settings.verifyChecksum ? 1 : 0; rdDword(L"verifyChecksum",  d); g_settings.verifyChecksum  = (d != 0);
+    d = g_settings.categorize     ? 1 : 0; rdDword(L"categorize",      d); g_settings.categorize      = (d != 0);
+    d = (DWORD)g_settings.windowX; rdDword(L"windowX", d); g_settings.windowX = (int)d;
+    d = (DWORD)g_settings.windowY; rdDword(L"windowY", d); g_settings.windowY = (int)d;
+    d = (DWORD)g_settings.windowW; rdDword(L"windowW", d); g_settings.windowW = (int)d;
+    d = (DWORD)g_settings.windowH; rdDword(L"windowH", d); g_settings.windowH = (int)d;
+    d = g_settings.windowMaximized ? 1 : 0; rdDword(L"windowMaximized", d); g_settings.windowMaximized = (d != 0);
+    RegCloseKey(hk);
+}
+
+void saveSettings() {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\matata", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
+        return;
+    auto wrString = [&](const wchar_t* name, const std::wstring& v) {
+        RegSetValueExW(hk, name, 0, REG_SZ, (const BYTE*)v.c_str(),
+                       (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    };
+    auto wrDword = [&](const wchar_t* name, DWORD v) {
+        RegSetValueExW(hk, name, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    };
+    auto wrQword = [&](const wchar_t* name, int64_t v) {
+        RegSetValueExW(hk, name, 0, REG_QWORD, (const BYTE*)&v, sizeof(v));
+    };
+    wrString(L"outputDir", g_settings.outputDir);
+    wrDword(L"connections",     (DWORD)g_settings.connections);
+    wrDword(L"maxJobs",         (DWORD)g_settings.maxJobs);
+    wrQword(L"bandwidthBps",    g_settings.bandwidthBps);
+    wrDword(L"clipboardWatch",  g_settings.clipboardWatch ? 1 : 0);
+    wrDword(L"verifyChecksum",  g_settings.verifyChecksum ? 1 : 0);
+    wrDword(L"categorize",      g_settings.categorize     ? 1 : 0);
+    wrDword(L"windowX", (DWORD)g_settings.windowX);
+    wrDword(L"windowY", (DWORD)g_settings.windowY);
+    wrDword(L"windowW", (DWORD)g_settings.windowW);
+    wrDword(L"windowH", (DWORD)g_settings.windowH);
+    wrDword(L"windowMaximized", g_settings.windowMaximized ? 1 : 0);
+    RegCloseKey(hk);
+}
+
+// ---- data model ------------------------------------------------------
+
+enum class ItemState { Queued, Running, Done, Err, Aborted, Paused };
+
+struct GuiItem {
+    int                            id = 0;
+    std::wstring                   url;
+    std::wstring                   filename;
+    std::wstring                   outDir;
+    std::wstring                   resultPath;
+    std::wstring                   message;
+    ItemState                      state = ItemState::Queued;
+    int64_t                        total = -1;
+    int64_t                        downloaded = 0;
+    int64_t                        bps = 0;
+    int                            activeConns = 0;
+    int                            segments = 0;
+    bool                           isVideo = false;
+    bool                           isFtp   = false;
+    bool                           isYtDlp = false;
+    bool                           isYtPlaylist = false; // expand into per-video children
+    std::wstring                   ytFormat;        // e.g. "best", "bestaudio"
+    std::wstring                   cookiesPath;     // Netscape cookies.txt to feed yt-dlp
+    HANDLE                         ytdlpProc = nullptr;
+    bool                           ytdlpAbort = false;
+    int64_t                        startedEpoch = 0;
+
+    std::shared_ptr<Downloader>    dl;
+    std::shared_ptr<VideoGrabber>  vg;
+    std::shared_ptr<FtpDownloader> ftp;
+    std::vector<std::pair<std::wstring,std::wstring>> headers;
+    std::unique_ptr<std::thread>   thread;
+};
+
+std::mutex                                  g_itemsMu;
+std::vector<std::unique_ptr<GuiItem>>       g_items;
+std::atomic<int>                            g_nextId{1};
+
+GuiItem* findItem(int id) {
+    for (auto& p : g_items) if (p->id == id) return p.get();
+    return nullptr;
+}
+
+bool looksLikeVideoUrl(const std::wstring& url) {
+    return looksLikeHlsUrl(url) || looksLikeDashUrl(url);
+}
+bool looksLikeFtpUrl(const std::wstring& url) {
+    return (url.size() > 6 && _wcsnicmp(url.c_str(), L"ftp://",  6) == 0)
+        || (url.size() > 7 && _wcsnicmp(url.c_str(), L"ftps://", 7) == 0);
+}
+// YouTube watch / shorts / playlist / youtu.be — yt-dlp handles these
+// reliably across cipher / SABR changes that our in-page extractor can't.
+bool looksLikeYouTubeUrl(const std::wstring& url) {
+    return url.find(L"youtube.com/watch")    != std::wstring::npos
+        || url.find(L"youtube.com/shorts/")  != std::wstring::npos
+        || url.find(L"youtube.com/playlist") != std::wstring::npos
+        || url.find(L"music.youtube.com/")   != std::wstring::npos
+        || url.find(L"youtu.be/")            != std::wstring::npos;
+}
+
+// `youtube.com/playlist?list=...` — multi-video container that should be
+// flattened into individual watch downloads. Plain `watch?v=...&list=...`
+// stays single-video (the user picked one specific video).
+bool looksLikeYouTubePlaylistUrl(const std::wstring& url) {
+    return url.find(L"youtube.com/playlist") != std::wstring::npos
+        || url.find(L"music.youtube.com/playlist") != std::wstring::npos;
+}
+
+const wchar_t* stateLabel(ItemState s) {
+    switch (s) {
+        case ItemState::Queued:  return L"queued";
+        case ItemState::Running: return L"running";
+        case ItemState::Done:    return L"done";
+        case ItemState::Err:     return L"err";
+        case ItemState::Aborted: return L"aborted";
+        case ItemState::Paused:  return L"queued";
+    }
+    return L"queued";
+}
+
+// ---- JSON encoding ---------------------------------------------------
+
+std::wstring jsonEscape(const std::wstring& s) {
+    std::wstring out; out.reserve(s.size() + 8);
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'"':  out += L"\\\""; break;
+            case L'\\': out += L"\\\\"; break;
+            case L'\n': out += L"\\n";  break;
+            case L'\r': out += L"\\r";  break;
+            case L'\t': out += L"\\t";  break;
+            case L'\b': out += L"\\b";  break;
+            case L'\f': out += L"\\f";  break;
+            default:
+                if (c < 0x20) {
+                    wchar_t buf[8];
+                    _snwprintf_s(buf, _TRUNCATE, L"\\u%04x", (unsigned)c);
+                    out += buf;
+                } else out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::wstring quoteJson(const std::wstring& s) {
+    std::wstring out = L"\"";
+    out += jsonEscape(s);
+    out += L"\"";
+    return out;
+}
+
+std::wstring serializeItem(const GuiItem& it) {
+    wchar_t buf[256];
+    std::wstring out = L"{";
+    _snwprintf_s(buf, _TRUNCATE, L"\"id\":%d,", it.id);                  out += buf;
+    out += L"\"url\":";        out += quoteJson(it.url);        out += L",";
+    out += L"\"filename\":";   out += quoteJson(it.filename);   out += L",";
+    out += L"\"outDir\":";     out += quoteJson(it.outDir);     out += L",";
+    out += L"\"resultPath\":"; out += quoteJson(it.resultPath); out += L",";
+    out += L"\"message\":";    out += quoteJson(it.message);    out += L",";
+    out += L"\"state\":";      out += quoteJson(stateLabel(it.state)); out += L",";
+    _snwprintf_s(buf, _TRUNCATE, L"\"total\":%lld,",      (long long)it.total);      out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"downloaded\":%lld,", (long long)it.downloaded); out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"bps\":%lld,",        (long long)it.bps);        out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"activeConns\":%d,",  it.activeConns); out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"segments\":%d,",     it.segments);    out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"startedEpoch\":%lld,",(long long)it.startedEpoch); out += buf;
+    // Surface request headers so the UI's Properties dialog can show
+    // Referer / User-Agent without a separate round-trip.
+    auto findHeader = [&](const wchar_t* name) -> std::wstring {
+        for (auto& kv : it.headers) {
+            if (_wcsicmp(kv.first.c_str(), name) == 0) return kv.second;
+        }
+        return L"";
+    };
+    out += L"\"referer\":";   out += quoteJson(findHeader(L"Referer"));   out += L",";
+    out += L"\"userAgent\":"; out += quoteJson(findHeader(L"User-Agent"));
+    out += L"}";
+    return out;
+}
+
+std::wstring serializeSettings() {
+    wchar_t buf[128];
+    std::wstring out = L"{";
+    out += L"\"outDir\":"; out += quoteJson(g_settings.outputDir); out += L",";
+    _snwprintf_s(buf, _TRUNCATE, L"\"connections\":%d,",  g_settings.connections);  out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"maxJobs\":%d,",      g_settings.maxJobs);      out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"bandwidthBps\":%lld,", (long long)g_settings.bandwidthBps); out += buf;
+    out += L"\"clipboardWatch\":"; out += g_settings.clipboardWatch ? L"true" : L"false"; out += L",";
+    out += L"\"verifyChecksum\":"; out += g_settings.verifyChecksum ? L"true" : L"false"; out += L",";
+    out += L"\"categorize\":";     out += g_settings.categorize     ? L"true" : L"false";
+    out += L"}";
+    return out;
+}
+
+// ---- bridge: post events from any thread to the UI -------------------
+
+void postEvent(std::wstring eventJson) {
+    auto* heap = new std::wstring(std::move(eventJson));
+    if (g_hwnd && PostMessageW(g_hwnd, WM_APP_BRIDGE_EVENT, 0, (LPARAM)heap))
+        return;
+    delete heap;
+}
+
+void executeOnUi(const std::wstring& eventJson) {
+    std::wstring script = L"window.matata && window.matata.onEvent(" + eventJson + L")";
+    if (g_webviewReady && g_webview) {
+        g_webview->ExecuteScript(script.c_str(), nullptr);
+    } else {
+        g_pendingScripts.push_back(script);
+    }
+}
+
+// Helpers for common event shapes
+void emitItem(const GuiItem& it) {
+    std::wstring ev = L"{\"type\":\"item\",\"item\":" + serializeItem(it) + L"}";
+    postEvent(std::move(ev));
+}
+
+void emitItemRemoved(int id) {
+    wchar_t buf[64];
+    _snwprintf_s(buf, _TRUNCATE, L"{\"type\":\"remove\",\"id\":%d}", id);
+    postEvent(buf);
+}
+
+void emitToast(const std::wstring& message, const wchar_t* kind = L"info") {
+    std::wstring ev = L"{\"type\":\"toast\",\"kind\":\"";
+    ev += kind;
+    ev += L"\",\"message\":";
+    ev += quoteJson(message);
+    ev += L"}";
+    postEvent(std::move(ev));
+}
+
+void emitItemsSnapshot() {
+    std::wstring ev = L"{\"type\":\"items\",\"list\":[";
+    bool first = true;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        for (auto& it : g_items) {
+            if (!first) ev += L",";
+            first = false;
+            ev += serializeItem(*it);
+        }
+    }
+    ev += L"]}";
+    postEvent(std::move(ev));
+}
+
+void emitSettings() {
+    std::wstring ev = L"{\"type\":\"settings\",\"settings\":" + serializeSettings() + L"}";
+    postEvent(std::move(ev));
+}
+
+// ---- background update check ----------------------------------------
+
+// Heap-allocated payload posted from the worker thread to the UI thread
+// on WM_APP_UPDATE_AVAIL. The handler owns it and frees with delete.
+struct UpdateAvailMsg {
+    std::wstring latestVersion;
+    std::wstring downloadUrl;
+    std::wstring notes;
+};
+
+void updateCheckWorker() {
+    UpdateInfo info;
+    std::wstring err;
+    if (!checkForUpdate(kUpdateManifestUrl, kMatataVersion, info, err)) {
+        dbgLog(L"updateCheck: fetch failed (%ls)", err.c_str());
+        return;
+    }
+    if (!info.available) {
+        dbgLog(L"updateCheck: up to date (local=%ls remote=%ls)",
+               kMatataVersion, info.latestVersion.c_str());
+        return;
+    }
+    auto* msg = new UpdateAvailMsg{
+        std::move(info.latestVersion),
+        std::move(info.downloadUrl),
+        std::move(info.notes),
+    };
+    if (!g_hwnd ||
+        !PostMessageW(g_hwnd, WM_APP_UPDATE_AVAIL, 0, (LPARAM)msg)) {
+        delete msg;
+    }
+}
+
+void onUpdateAvailable(UpdateAvailMsg* m) {
+    std::unique_ptr<UpdateAvailMsg> g(m);
+    // Render an IDM-style "new version available" prompt. MessageBox is
+    // intentionally minimal; the goal is parity with IDM's Update / Cancel
+    // dialog without growing a custom-dialog footprint.
+    std::wstring text = L"matata " + m->latestVersion + L" is available.\n\n";
+    text += L"You're running matata " + std::wstring(kMatataVersion) + L".";
+    if (!m->notes.empty()) {
+        text += L"\n\nWhat's new:\n";
+        text += m->notes;
+    }
+    text += L"\n\nUpdate now?";
+    int r = MessageBoxW(g_hwnd, text.c_str(),
+                        L"matata - Update available",
+                        MB_YESNO | MB_ICONINFORMATION);
+    if (r == IDYES && !m->downloadUrl.empty()) {
+        ShellExecuteW(g_hwnd, L"open", m->downloadUrl.c_str(),
+                      nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+// ---- worker message types (used by both regular + yt-dlp workers) ---
+
+struct ProgressMsg {
+    int     id;
+    int64_t total;
+    int64_t downloaded;
+    int64_t bps;
+    int     activeConns;
+    int     segments;
+};
+struct CompleteMsg {
+    int             id;
+    DownloadStatus  status;
+    std::wstring    message;
+    std::wstring    path;
+};
+
+// ---- yt-dlp worker --------------------------------------------------
+
+std::wstring quoteArg(const std::wstring& s) {
+    // Quote on whitespace/quotes (for CreateProcess argv parsing) AND on
+    // cmd.exe metacharacters (& | ^ < > ( ) %), because we now wrap yt-dlp
+    // via `cmd.exe /S /C "..."` so those would otherwise be interpreted.
+    if (s.find_first_of(L" \t\"&|^<>()%") == std::wstring::npos) return s;
+    std::wstring out = L"\"";
+    for (size_t i = 0; i < s.size(); ++i) {
+        int slashes = 0;
+        while (i < s.size() && s[i] == L'\\') { ++slashes; ++i; }
+        if (i == s.size()) { out.append(slashes * 2, L'\\'); break; }
+        if (s[i] == L'"') { out.append(slashes * 2 + 1, L'\\'); out.push_back(L'"'); }
+        else              { out.append(slashes, L'\\'); out.push_back(s[i]); }
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+std::wstring exeDirEarly() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0) return L"";
+    std::wstring p(buf, n);
+    auto slash = p.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? L"" : p.substr(0, slash);
+}
+
+std::wstring defaultDownloadsDir() {
+    PWSTR path = nullptr;
+    if (SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &path) != S_OK || !path) return L"";
+    std::wstring s(path);
+    CoTaskMemFree(path);
+    return s;
+}
+
+int64_t parseSizeWithUnit(const std::wstring& num, const std::wstring& unit) {
+    double v = _wtof(num.c_str());
+    if (unit.find(L"GiB") != std::wstring::npos || unit.find(L"GB") != std::wstring::npos) v *= 1024.0 * 1024.0 * 1024.0;
+    else if (unit.find(L"MiB") != std::wstring::npos || unit.find(L"MB") != std::wstring::npos) v *= 1024.0 * 1024.0;
+    else if (unit.find(L"KiB") != std::wstring::npos || unit.find(L"KB") != std::wstring::npos) v *= 1024.0;
+    return (int64_t)v;
+}
+
+// yt-dlp emits lines like:
+//   [download]   3.4% of   12.34MiB at  1.23MiB/s ETA 00:30
+//   [download] Destination: C:\Users\...\foo.mp4
+//   [Merger]   Merging formats into "foo.mkv"
+void parseYtDlpProgress(int id, const std::wstring& line, std::wstring& outputPath) {
+    if (line.compare(0, 10, L"[download]") == 0) {
+        size_t pct = line.find(L'%');
+        if (pct != std::wstring::npos) {
+            size_t s = pct;
+            while (s > 0 && (iswdigit(line[s-1]) || line[s-1] == L'.')) --s;
+            double percent = _wtof(line.substr(s, pct - s).c_str());
+
+            int64_t total = 0, bps = 0;
+            size_t ofPos = line.find(L"of", pct);
+            if (ofPos != std::wstring::npos) {
+                size_t i = ofPos + 2;
+                while (i < line.size() && (line[i] == L' ' || line[i] == L'~')) ++i;
+                size_t numStart = i;
+                while (i < line.size() && (iswdigit(line[i]) || line[i] == L'.')) ++i;
+                std::wstring num = line.substr(numStart, i - numStart);
+                size_t unitEnd = i;
+                while (unitEnd < line.size() && line[unitEnd] != L' ') ++unitEnd;
+                std::wstring unit = line.substr(i, unitEnd - i);
+                total = parseSizeWithUnit(num, unit);
+            }
+            size_t atPos = line.find(L"at ", pct);
+            if (atPos != std::wstring::npos) {
+                size_t i = atPos + 3;
+                while (i < line.size() && line[i] == L' ') ++i;
+                size_t numStart = i;
+                while (i < line.size() && (iswdigit(line[i]) || line[i] == L'.')) ++i;
+                std::wstring num = line.substr(numStart, i - numStart);
+                size_t unitEnd = i;
+                while (unitEnd < line.size() && line[unitEnd] != L'/') ++unitEnd;
+                std::wstring unit = line.substr(i, unitEnd - i);
+                bps = parseSizeWithUnit(num, unit);
+            }
+            int64_t downloaded = (total > 0) ? (int64_t)(total * percent / 100.0) : 0;
+            auto* msg = new ProgressMsg{ id, total, downloaded, bps, 1, 0 };
+            if (!PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, (LPARAM)msg)) delete msg;
+        }
+        size_t dest = line.find(L"Destination: ");
+        if (dest != std::wstring::npos) outputPath = line.substr(dest + 13);
+    }
+    size_t merge = line.find(L"Merging formats into \"");
+    if (merge != std::wstring::npos) {
+        size_t a = merge + 22;
+        size_t b = line.find(L'"', a);
+        if (b != std::wstring::npos) outputPath = line.substr(a, b - a);
+    }
+}
+
+// Forward decl — addDownloadEx is defined further down but used here.
+int addDownloadEx(const HandoffSpec& spec);
+
+// Flatten a YouTube playlist URL into individual watch URLs and queue
+// each as its own download. The current item (the playlist row) is
+// marked Done with a summary message once enumeration finishes.
+void workerYtDlpPlaylist(int id) {
+    dbgLog(L"workerYtDlpPlaylist ENTER id=%d", id);
+    HandoffSpec parent;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it) return;
+        parent.url      = it->url;
+        parent.outDir   = it->outDir;
+        parent.ytFormat = it->ytFormat;
+        for (auto& kv : it->headers) {
+            if      (_wcsicmp(kv.first.c_str(), L"Referer") == 0)    parent.referer   = kv.second;
+            else if (_wcsicmp(kv.first.c_str(), L"Cookie") == 0)     parent.cookie    = kv.second;
+            else if (_wcsicmp(kv.first.c_str(), L"User-Agent") == 0) parent.userAgent = kv.second;
+        }
+    }
+
+    // Locate yt-dlp / Python the same way workerYtDlp does.
+    auto findSystemPython = []() -> std::wstring {
+        const wchar_t* candidates[] = {
+            L"C:\\Python314\\python.exe", L"C:\\Python313\\python.exe",
+            L"C:\\Python312\\python.exe", L"C:\\Python311\\python.exe",
+            L"C:\\Python310\\python.exe",
+        };
+        for (const wchar_t* p : candidates) {
+            if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) return p;
+        }
+        return L"";
+    };
+    std::wstring sysPython = findSystemPython();
+    std::wstring exe;
+    bool useSystemPython = !sysPython.empty();
+    if (useSystemPython) {
+        exe = sysPython;
+    } else {
+        exe = exeDirEarly() + L"\\yt-dlp.exe";
+        if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            auto* done = new CompleteMsg{ id, DownloadStatus::NetworkError,
+                L"yt-dlp.exe not found", L"" };
+            if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+            return;
+        }
+    }
+
+    std::wstring cmd = quoteArg(exe);
+    if (useSystemPython) cmd += L" -m yt_dlp";
+    // yt-dlp's --print template engine does NOT interpret backslash escapes
+    // (\t / \n) — they pass through literally. Embed a real TAB character as
+    // the field separator so each emitted line has the form
+    //   "<playlist_title>\t<id>\t<title>".
+    cmd += L" --flat-playlist --print \"%(playlist_title|)s\t%(id)s\t%(title)s\" ";
+    cmd += quoteArg(parent.url);
+
+    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        auto* done = new CompleteMsg{ id, DownloadStatus::NetworkError, L"CreatePipe failed", L"" };
+        if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+        return;
+    }
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput  = hWrite;
+    si.hStdError   = hWrite;
+    si.hStdInput   = INVALID_HANDLE_VALUE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(hWrite);
+    if (!ok) {
+        CloseHandle(hRead);
+        auto* done = new CompleteMsg{ id, DownloadStatus::NetworkError,
+            L"CreateProcess failed", L"" };
+        if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+        return;
+    }
+
+    // Read stdout — each line is "<playlist_title>\t<id>\t<title>". Queue
+    // each as a watch URL.
+    auto sanitizeForFilename = [](std::wstring& s) {
+        for (wchar_t& c : s) {
+            if (c == L'\\' || c == L'/' || c == L':' || c == L'*' ||
+                c == L'?'  || c == L'"' || c == L'<' || c == L'>' || c == L'|')
+                c = L'_';
+        }
+        while (!s.empty() && (s.back() == L' ' || s.back() == L'.')) s.pop_back();
+        if (s.size() > 120) s.resize(120);
+    };
+    std::string raw;
+    char chunk[4096];
+    DWORD got = 0;
+    int queued = 0;
+    std::wstring playlistTitle;
+    while (ReadFile(hRead, chunk, sizeof(chunk), &got, nullptr) && got > 0) {
+        raw.append(chunk, got);
+        for (;;) {
+            auto nl = raw.find_first_of("\r\n");
+            if (nl == std::string::npos) break;
+            std::string line = raw.substr(0, nl);
+            raw.erase(0, nl + 1);
+            if (line.empty()) continue;
+            int n = MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), nullptr, 0);
+            std::wstring wline(n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), wline.data(), n);
+            // Split on the two tab separators.
+            auto tab1 = wline.find(L'\t');
+            if (tab1 == std::wstring::npos) continue;
+            auto tab2 = wline.find(L'\t', tab1 + 1);
+            std::wstring plTitle = wline.substr(0, tab1);
+            std::wstring vid     = (tab2 == std::wstring::npos)
+                                   ? wline.substr(tab1 + 1)
+                                   : wline.substr(tab1 + 1, tab2 - tab1 - 1);
+            std::wstring title   = (tab2 == std::wstring::npos)
+                                   ? L""
+                                   : wline.substr(tab2 + 1);
+            if (vid.empty() || vid == L"NA") continue;
+            if (playlistTitle.empty() && !plTitle.empty()) playlistTitle = plTitle;
+            // Sanitize title for use as a filename — strip Windows-illegal
+            // chars and clamp length so disk write succeeds.
+            sanitizeForFilename(title);
+            HandoffSpec child = parent;
+            child.url      = L"https://www.youtube.com/watch?v=" + vid;
+            child.filename = title.empty() ? L"" : title + L".mp4";
+            addDownloadEx(child);
+            ++queued;
+        }
+    }
+    // Stamp the parent (playlist) row with the playlist title so the UI shows
+    // something meaningful instead of the URL leaf "playlist".
+    if (!playlistTitle.empty()) {
+        sanitizeForFilename(playlistTitle);
+        GuiItem snap{};
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMu);
+            GuiItem* it = findItem(id);
+            if (it) {
+                it->filename = playlistTitle;
+                snap.id           = it->id;
+                snap.url          = it->url;
+                snap.filename     = it->filename;
+                snap.outDir       = it->outDir;
+                snap.resultPath   = it->resultPath;
+                snap.message      = it->message;
+                snap.state        = it->state;
+                snap.total        = it->total;
+                snap.downloaded   = it->downloaded;
+                snap.bps          = it->bps;
+                snap.activeConns  = it->activeConns;
+                snap.segments     = it->segments;
+                snap.startedEpoch = it->startedEpoch;
+                snap.headers      = it->headers;
+                have = true;
+            }
+        }
+        if (have) emitItem(snap);
+    }
+    CloseHandle(hRead);
+    DWORD rc = 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    dbgLog(L"workerYtDlpPlaylist EXIT id=%d rc=%lu queued=%d", id, rc, queued);
+
+    DownloadStatus status = (rc == 0 && queued > 0)
+        ? DownloadStatus::Ok : DownloadStatus::NetworkError;
+    std::wstring msg = (queued > 0)
+        ? (L"Queued " + std::to_wstring(queued) + L" videos from playlist")
+        : L"Could not enumerate playlist";
+    auto* done = new CompleteMsg{ id, status, msg, L"" };
+    if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+}
+
+void workerYtDlp(int id) {
+    dbgLog(L"workerYtDlp ENTER id=%d", id);
+    std::wstring url, outDir, fmt, cookiesPath;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it) return;
+        url         = it->url;
+        outDir      = it->outDir.empty() ? defaultDownloadsDir() : it->outDir;
+        fmt         = it->ytFormat.empty() ? L"bv*+ba/best" : it->ytFormat;
+        cookiesPath = it->cookiesPath;
+    }
+
+    // Prefer pip-installed yt-dlp via the system Python over the bundled
+    // PyInstaller win-exe. The win-exe's frozen Python doesn't see PATH
+    // changes our cmd.exe wrapper makes, so it always reports
+    // `JS runtimes: none` and can't solve YouTube's signature/n-challenge.
+    // System Python doesn't have that blind spot.
+    auto findSystemPython = []() -> std::wstring {
+        const wchar_t* candidates[] = {
+            L"C:\\Python314\\python.exe",
+            L"C:\\Python313\\python.exe",
+            L"C:\\Python312\\python.exe",
+            L"C:\\Python311\\python.exe",
+            L"C:\\Python310\\python.exe",
+        };
+        for (const wchar_t* p : candidates) {
+            if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) return p;
+        }
+        // Fall back to whatever `py.exe` (the launcher) resolves.
+        wchar_t windir[MAX_PATH] = {};
+        GetWindowsDirectoryW(windir, MAX_PATH);
+        std::wstring py = std::wstring(windir) + L"\\py.exe";
+        if (GetFileAttributesW(py.c_str()) != INVALID_FILE_ATTRIBUTES) return py;
+        return L"";
+    };
+    std::wstring sysPython = findSystemPython();
+    bool useSystemPython = !sysPython.empty();
+    std::wstring ytdlp;
+    if (useSystemPython) {
+        // Verify pip-installed yt_dlp is importable. If not, fall back to
+        // the bundled exe.
+        std::wstring probeCmd = quoteArg(sysPython) +
+            L" -c \"import yt_dlp\"";
+        STARTUPINFOW psi{}; psi.cb = sizeof(psi);
+        psi.dwFlags = STARTF_USESHOWWINDOW; psi.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION ppi{};
+        std::vector<wchar_t> probeBuf(probeCmd.begin(), probeCmd.end());
+        probeBuf.push_back(L'\0');
+        if (CreateProcessW(nullptr, probeBuf.data(), nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &psi, &ppi)) {
+            WaitForSingleObject(ppi.hProcess, 5000);
+            DWORD ec = 0; GetExitCodeProcess(ppi.hProcess, &ec);
+            CloseHandle(ppi.hProcess); CloseHandle(ppi.hThread);
+            if (ec != 0) useSystemPython = false;
+        } else {
+            useSystemPython = false;
+        }
+    }
+    if (useSystemPython) {
+        ytdlp = sysPython;
+        dbgLog(L"workerYtDlp using system Python: %ls", sysPython.c_str());
+    } else {
+        ytdlp = exeDirEarly() + L"\\yt-dlp.exe";
+        if (GetFileAttributesW(ytdlp.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            auto* done = new CompleteMsg{ id, DownloadStatus::NetworkError,
+                L"yt-dlp.exe not found next to matata-gui.exe", L"" };
+            if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+            return;
+        }
+        dbgLog(L"workerYtDlp using bundled yt-dlp.exe (system Python unavailable)");
+    }
+
+    std::wstring tpl = outDir;
+    if (!tpl.empty() && tpl.back() != L'\\' && tpl.back() != L'/') tpl.push_back(L'\\');
+    tpl += L"%(title)s.%(ext)s";
+
+    std::wstring cmd = quoteArg(ytdlp);
+    if (useSystemPython) cmd += L" -m yt_dlp";
+    // --verbose + leaving warnings on so we can see why yt-dlp filters out
+    // every format (PO token, format-id mismatch, etc.). Drop both once the
+    // YouTube path is reliable again.
+    cmd += L" --newline --verbose --no-playlist --no-mtime";
+    cmd += L" -f " + quoteArg(fmt);
+    cmd += L" --merge-output-format mp4";
+    // Prefer page-fresh cookies the extension shipped via a temp Netscape
+    // cookies.txt file (no 32KB CreateProcess limit, and includes the live
+    // SAPISIDHASH / VISITOR_INFO_LIVE that the disk-stored Firefox profile
+    // sometimes lacks — yt-dlp otherwise gets bumped to a "tv downgraded"
+    // player_client that has no high-res formats). Fall back to extracting
+    // from Firefox if no file was supplied.
+    // Intentionally NOT passing --cookies / --cookies-from-browser to yt-dlp
+    // for YouTube. Verified: when cookies are supplied yt-dlp logs
+    // `Skipping client "ios" since it does not support cookies` and falls
+    // back to web/mweb clients that require JS-solved signature + n-challenge
+    // (which fails with `JS runtimes: none` on this build). Without cookies
+    // yt-dlp uses the ios client, which returns plain DASH formats up to 720p
+    // AV1 + m4a audio that download cleanly. We still write the temp cookies
+    // file (used by future age-gated / region-locked paths) and leave the
+    // cleanup at the end of this worker.
+    bool haveCookieFile = !cookiesPath.empty() &&
+        GetFileAttributesW(cookiesPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    // Coax yt-dlp into returning the full adaptive format set:
+    //   - `formats=missing_pot` keeps formats that look like they need a PO
+    //     token instead of silently filtering them out (with our cookies they
+    //     usually work, and the ones that don't 403 are skipped at retrieval).
+    //   - the `default` client is the same `web` yt-dlp uses by default, but
+    //     listing it explicitly stops yt-dlp from downgrading to the limited
+    //     `tv` client just because no PO token was supplied.
+    //   - `web_embedded`, `mweb`, `ios`, `android_creator` are added as
+    //     fallbacks; yt-dlp merges formats from every client that responds.
+    cmd += L" --extractor-args \"youtube:player_client=default,web_embedded,mweb,ios,android_creator;formats=missing_pot\"";
+    // Prefer DASH over HLS. yt-dlp's default format ranker would otherwise
+    // pick an HLS premium format (e.g. itag 616) that's served behind
+    // SABR/signature gates; without a working JS solver every fragment 403s
+    // and the row gets stuck in RUNNING with no progress. The `ios` /
+    // `android` clients return plain DASH (https) for the same heights, so
+    // ranking by protocol pushes those to the top.
+    cmd += L" --format-sort proto";
+    // Tell yt-dlp where ffmpeg is so it can mux video+audio into a clean
+    // .mp4 (without ffmpeg yt-dlp falls back to .webm for opus audio).
+    std::wstring ffmpeg = exeDirEarly() + L"\\ffmpeg.exe";
+    if (GetFileAttributesW(ffmpeg.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        cmd += L" --ffmpeg-location " + quoteArg(ffmpeg);
+    }
+    cmd += L" -o " + quoteArg(tpl);
+    cmd += L" " + quoteArg(url);
+
+    // Wrap yt-dlp inside `cmd.exe /S /C "set PATH=...&& yt-dlp ..."`. The
+    // PyInstaller bundle that ships yt-dlp.exe ignores PATH changes made via
+    // SetEnvironmentVariableW in the parent (we still log that we patched it
+    // — verbose yt-dlp output keeps reporting `JS runtimes: none`). Setting
+    // PATH inside cmd.exe's own env block is the one place we know yt-dlp's
+    // signature/n-challenge solver actually picks up node.exe.
+    {
+        wchar_t sysroot[MAX_PATH] = {};
+        GetSystemDirectoryW(sysroot, MAX_PATH);
+        std::wstring cmdExe = std::wstring(sysroot) + L"\\cmd.exe";
+        std::wstring extraPath;
+        const wchar_t* pathCands[] = {
+            L"C:\\Program Files\\nodejs",
+            L"C:\\Program Files (x86)\\nodejs",
+            L"C:\\Program Files\\Deno",
+            L"C:\\Program Files\\Bun",
+        };
+        for (const wchar_t* p : pathCands) {
+            if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) {
+                if (!extraPath.empty()) extraPath += L";";
+                extraPath += p;
+            }
+        }
+        // cmd.exe's `set` doesn't tolerate `^` `&` `|` etc. without quoting
+        // — wrap the value in quotes. Inner quotes inside our yt-dlp args
+        // (e.g. --extractor-args "youtube:...") need to be escaped from
+        // cmd.exe — but we already quote-wrap the whole cmd string with
+        // /S /C "..." which lets cmd treat everything between the outer
+        // quotes verbatim. So no further escaping is needed.
+        // PYTHONIOENCODING + PYTHONUTF8 force yt-dlp's stdout to UTF-8 so we
+        // can correctly parse paths that contain non-cp1252 characters
+        // (YouTube replaces `|` in titles with full-width U+FF5C, which
+        // otherwise comes through our pipe as spaces and breaks the final
+        // file-size lookup).
+        // The `where node` line helps diagnose PATH problems: its output
+        // lands in our captured stdout pipe and is logged as a yt-dlp[N]
+        // line, so we can see whether cmd actually picks up node.exe.
+        std::wstring inner =
+            L"set \"PATH=" + extraPath + L";%PATH%\" && "
+            L"set \"PYTHONIOENCODING=utf-8\" && "
+            L"set \"PYTHONUTF8=1\" && "
+            L"where node 2>&1 && "
+            + cmd;
+        cmd = quoteArg(cmdExe) + L" /S /C \"" + inner + L"\"";
+    }
+
+    dbgLog(L"workerYtDlp cmd=%ls", cmd.c_str());
+
+    // yt-dlp needs a JavaScript runtime (node / deno / bun / quickjs) to
+    // solve YouTube's signature + n-challenge. When matata-gui is launched
+    // from a browser → matata-host chain, the inherited PATH usually doesn't
+    // include `C:\Program Files\nodejs`, so yt-dlp logs `JS runtimes: none`
+    // and ends up with "Only images are available for download".
+    // Build a child env that prepends candidate runtime directories to PATH.
+    auto findRuntimeDir = []() -> std::wstring {
+        // Try common install paths and HKLM registry hints. First match wins.
+        const wchar_t* candidates[] = {
+            L"C:\\Program Files\\nodejs\\node.exe",
+            L"C:\\Program Files (x86)\\nodejs\\node.exe",
+            L"C:\\Program Files\\Deno\\deno.exe",
+            L"C:\\Program Files\\Bun\\bun.exe",
+        };
+        for (const wchar_t* p : candidates) {
+            if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) {
+                std::wstring s = p;
+                auto slash = s.find_last_of(L"\\/");
+                return (slash == std::wstring::npos) ? L"" : s.substr(0, slash);
+            }
+        }
+        // HKLM\SOFTWARE\Node.js\InstallPath (set by the Node MSI).
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Node.js", 0, KEY_READ, &hk) == ERROR_SUCCESS) {
+            wchar_t buf[MAX_PATH] = {};
+            DWORD cb = sizeof(buf);
+            DWORD type = 0;
+            if (RegQueryValueExW(hk, L"InstallPath", nullptr, &type, (LPBYTE)buf, &cb) == ERROR_SUCCESS &&
+                (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                RegCloseKey(hk);
+                return std::wstring(buf);
+            }
+            RegCloseKey(hk);
+        }
+        return L"";
+    };
+    std::wstring runtimeDir = findRuntimeDir();
+
+    // Belt-and-suspenders: also drop a copy of node.exe (or whichever runtime
+    // was found) next to yt-dlp.exe. yt-dlp's PyInstaller bundle searches its
+    // own dir before PATH on Windows, so this is the most reliable way to
+    // make sure the JS challenge solver finds a runtime regardless of how
+    // PATH was inherited. Idempotent — the first run copies, future runs no-op.
+    if (!runtimeDir.empty()) {
+        std::wstring exeDir = exeDirEarly();
+        struct { const wchar_t* exe; } names[] = {
+            { L"node.exe" }, { L"deno.exe" }, { L"bun.exe" }, { L"qjs.exe" }
+        };
+        for (auto& nm : names) {
+            std::wstring src = runtimeDir + L"\\" + nm.exe;
+            std::wstring dst = exeDir + L"\\" + nm.exe;
+            if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            if (GetFileAttributesW(dst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                dbgLog(L"workerYtDlp JS runtime already at %ls", dst.c_str());
+                break;
+            }
+            BOOL copied = CopyFileW(src.c_str(), dst.c_str(), TRUE);
+            dbgLog(L"workerYtDlp CopyFileW %ls -> %ls : %ls",
+                   src.c_str(), dst.c_str(),
+                   copied ? L"OK" : L"FAILED");
+            if (copied) break;
+        }
+    }
+
+    std::wstring savedPath;
+    static std::mutex s_envMu;
+    std::unique_lock<std::mutex> envLk(s_envMu, std::defer_lock);
+    bool pathPatched = false;
+    if (!runtimeDir.empty()) {
+        // Mutate the parent's PATH briefly so the child inherits it via the
+        // standard CreateProcess env-inheritance path. Mutex serializes
+        // concurrent yt-dlp launches so they don't trample each other's PATH
+        // restores. Held until just after CreateProcess returns.
+        envLk.lock();
+        wchar_t cur[32768] = {};
+        DWORD n = GetEnvironmentVariableW(L"PATH", cur, 32768);
+        if (n > 0) savedPath.assign(cur, n);
+        std::wstring newPath = runtimeDir;
+        if (!savedPath.empty()) { newPath += L";"; newPath += savedPath; }
+        SetEnvironmentVariableW(L"PATH", newPath.c_str());
+        pathPatched = true;
+        dbgLog(L"workerYtDlp PATH prefix=%ls (savedPath len=%lu)",
+               runtimeDir.c_str(), (unsigned long)savedPath.size());
+    } else {
+        dbgLog(L"workerYtDlp no JS runtime found — yt-dlp may fail signature solving");
+    }
+
+    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        auto* done = new CompleteMsg{ id, DownloadStatus::NetworkError, L"CreatePipe failed", L"" };
+        if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+        return;
+    }
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput  = hWrite;
+    si.hStdError   = hWrite;
+    si.hStdInput   = INVALID_HANDLE_VALUE;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (pathPatched) {
+        SetEnvironmentVariableW(L"PATH", savedPath.empty() ? nullptr : savedPath.c_str());
+        envLk.unlock();
+    }
+    CloseHandle(hWrite);
+    if (!ok) {
+        CloseHandle(hRead);
+        DWORD ec = GetLastError();
+        auto* done = new CompleteMsg{ id, DownloadStatus::NetworkError,
+            L"CreateProcess failed: " + std::to_wstring(ec), L"" };
+        if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (it) it->ytdlpProc = pi.hProcess;
+    }
+
+    std::string raw;
+    char chunk[4096];
+    DWORD got = 0;
+    std::wstring outputPath;
+    std::wstring lastErr;
+    while (ReadFile(hRead, chunk, sizeof(chunk), &got, nullptr) && got > 0) {
+        raw.append(chunk, got);
+        for (;;) {
+            auto nl = raw.find_first_of("\r\n");
+            if (nl == std::string::npos) break;
+            std::string line = raw.substr(0, nl);
+            raw.erase(0, nl + 1);
+            if (line.empty()) continue;
+            int n = MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), nullptr, 0);
+            std::wstring wline(n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, line.data(), (int)line.size(), wline.data(), n);
+            // Log everything that isn't a noisy [download] X.X% line so we
+            // can see what yt-dlp / ffmpeg are actually doing.
+            const bool isProgress = (wline.compare(0, 11, L"[download] ") == 0) &&
+                                    (wline.find(L'%') != std::wstring::npos);
+            if (!isProgress) dbgLog(L"yt-dlp[%d]: %ls", id, wline.c_str());
+            if (wline.find(L"ERROR") != std::wstring::npos ||
+                wline.find(L"WARNING") != std::wstring::npos) lastErr = wline;
+            parseYtDlpProgress(id, wline, outputPath);
+        }
+    }
+    CloseHandle(hRead);
+    DWORD rc = 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    dbgLog(L"workerYtDlp EXIT id=%d rc=%lu outputPath=[%ls] lastErr=[%ls]",
+           id, rc, outputPath.c_str(), lastErr.c_str());
+
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (it) it->ytdlpProc = nullptr;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    DownloadStatus status;
+    std::wstring   message;
+    bool aborted = false;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        aborted = it && it->ytdlpAbort;
+    }
+    if (aborted)        { status = DownloadStatus::Aborted; }
+    else if (rc == 0)   { status = DownloadStatus::Ok; }
+    else                { status = DownloadStatus::NetworkError;
+                          message = L"yt-dlp exited with code " + std::to_wstring((int)rc); }
+
+    // On success, fix the GUI's total/downloaded by reading the merged
+    // file's actual size — otherwise the row still shows the audio chunk's
+    // size from the last [download] Destination line before the merge.
+    if (status == DownloadStatus::Ok && !outputPath.empty()) {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExW(outputPath.c_str(), GetFileExInfoStandard, &fad)) {
+            int64_t sz = ((int64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            auto* fix = new ProgressMsg{ id, sz, sz, 0, 0, 0 };
+            if (!PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, (LPARAM)fix)) delete fix;
+        }
+    }
+
+    auto* done = new CompleteMsg{ id, status, message, outputPath };
+    if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done)) delete done;
+
+    // Best-effort: erase the temp cookies file we asked yt-dlp to read.
+    // Holds the user's session — leaving it in %TEMP% is a privacy risk.
+    if (haveCookieFile) DeleteFileW(cookiesPath.c_str());
+}
+
+// ---- worker ---------------------------------------------------------
+
+void workerRun(int id) {
+    std::shared_ptr<Downloader>    dl;
+    std::shared_ptr<VideoGrabber>  vg;
+    std::shared_ptr<FtpDownloader> ftp;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it) return;
+        dl  = it->dl;
+        vg  = it->vg;
+        ftp = it->ftp;
+    }
+
+    auto httpProgress = [id](const DownloadProgress& p) {
+        auto* msg = new ProgressMsg{ id, p.total, p.downloaded,
+                                     p.bytesPerSec, p.activeConns, p.segments };
+        if (!PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, (LPARAM)msg))
+            delete msg;
+    };
+    auto videoProgress = [id](const VideoProgress& p) {
+        // HLS doesn't know the final size up front, so we extrapolate total
+        // bytes from per-segment average. Until the first segment lands,
+        // total stays -1 (the UI shows just the downloaded byte count and
+        // hides the percentage).
+        int64_t total = -1;
+        if (p.segmentsDone > 0 && p.segmentsTotal > 0 && p.bytes > 0) {
+            total = (p.bytes / p.segmentsDone) * p.segmentsTotal;
+            if (total < p.bytes) total = p.bytes; // never report < downloaded
+        }
+        auto* msg = new ProgressMsg{ id, total, p.bytes,
+                                     p.bytesPerSec, 0, p.segmentsTotal };
+        if (!PostMessageW(g_hwnd, WM_APP_PROGRESS, 0, (LPARAM)msg))
+            delete msg;
+    };
+    if (dl)  dl->setProgressCallback(httpProgress);
+    if (vg)  vg->setProgressCallback(videoProgress);
+    if (ftp) ftp->setProgressCallback(httpProgress);
+
+    DownloadResult r;
+    if (vg)       r = vg->run();
+    else if (ftp) r = ftp->run();
+    else if (dl)  r = dl->run();
+    else return;
+
+    auto* done = new CompleteMsg{ id, r.status, r.message, r.outputPath };
+    if (!PostMessageW(g_hwnd, WM_APP_COMPLETED, 0, (LPARAM)done))
+        delete done;
+}
+
+// ---- item ops --------------------------------------------------------
+
+std::wstring resolveOutDir(const std::wstring& perItem) {
+    return perItem.empty() ? g_settings.outputDir : perItem;
+}
+
+int addDownloadEx(const HandoffSpec& spec) {
+    if (spec.url.empty()) return 0;
+    // Deduplicate: if the same URL is already running (or queued), bring
+    // the window forward and bail. Stops rapid double-clicks from spawning
+    // parallel yt-dlp/ffmpeg pipelines that fight over the same temp files.
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        for (auto& p : g_items) {
+            if (p->url == spec.url &&
+                (p->state == ItemState::Running || p->state == ItemState::Queued)) {
+                dbgLog(L"addDownloadEx SKIP duplicate active url=%ls existingId=%d",
+                       spec.url.c_str(), p->id);
+                emitToast(L"Already downloading this URL", L"info");
+                return p->id;
+            }
+        }
+    }
+    bool ytMatch = looksLikeYouTubeUrl(spec.url);
+    dbgLog(L"addDownloadEx url=%ls", spec.url.c_str());
+    dbgLog(L"  isYtDlp=%d isVideo=%d isFtp=%d filename=%ls outDir=%ls",
+           (int)ytMatch,
+           (int)looksLikeVideoUrl(spec.url),
+           (int)looksLikeFtpUrl(spec.url),
+           spec.filename.c_str(), spec.outDir.c_str());
+    auto it = std::make_unique<GuiItem>();
+    it->id       = g_nextId.fetch_add(1);
+    it->url      = spec.url;
+    it->filename = spec.filename;
+    it->outDir   = resolveOutDir(spec.outDir);
+    it->isYtDlp  = ytMatch;
+    it->isYtPlaylist = it->isYtDlp && looksLikeYouTubePlaylistUrl(spec.url);
+    it->isVideo  = !it->isYtDlp && looksLikeVideoUrl(spec.url);
+    it->isFtp    = !it->isYtDlp && looksLikeFtpUrl(spec.url);
+    // Concurrency cap: if there are already maxJobs items running, hold this
+    // one as Queued. The dispatcher in onCompleted will start it later.
+    // Playlist enumeration (isYtPlaylist) is exempt — it's a fast metadata
+    // call, not a real download — so it always runs immediately.
+    int runningNow = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        for (auto& p : g_items) if (p->state == ItemState::Running) ++runningNow;
+    }
+    bool capped = !it->isYtPlaylist && g_settings.maxJobs > 0 &&
+                  runningNow >= g_settings.maxJobs;
+    it->state    = capped ? ItemState::Queued : ItemState::Running;
+    it->startedEpoch = (int64_t)std::time(nullptr);
+
+    if (!spec.referer.empty())   it->headers.push_back({L"Referer",    spec.referer});
+    if (!spec.cookie.empty())    it->headers.push_back({L"Cookie",     spec.cookie});
+    if (!spec.userAgent.empty()) it->headers.push_back({L"User-Agent", spec.userAgent});
+    it->ytFormat    = spec.ytFormat;
+    it->cookiesPath = spec.cookiesPath;
+
+    if (it->isYtDlp) {
+        // No backing Downloader/VideoGrabber/FtpDownloader — workerYtDlp
+        // wraps the yt-dlp.exe child process directly.
+    } else if (it->isVideo) {
+        VideoOptions vo;
+        vo.outputDir  = it->outDir;
+        vo.outputName = spec.filename;
+        vo.quality    = L"best";
+        vo.headers    = it->headers;
+        it->vg = std::make_shared<VideoGrabber>(it->url, vo);
+    } else if (it->isFtp) {
+        DownloadOptions dlo;
+        dlo.outputDir    = it->outDir;
+        dlo.outputName   = spec.filename;
+        dlo.bandwidthBps = g_settings.bandwidthBps;
+        dlo.headers      = it->headers;
+        it->ftp = std::make_shared<FtpDownloader>(it->url, dlo);
+    } else {
+        DownloadOptions dlo;
+        dlo.outputDir      = it->outDir;
+        dlo.outputName     = spec.filename;
+        dlo.connections    = g_settings.connections;
+        dlo.bandwidthBps   = g_settings.bandwidthBps;
+        dlo.verifyChecksum = g_settings.verifyChecksum;
+        dlo.headers        = it->headers;
+        it->dl = std::make_shared<Downloader>(it->url, dlo);
+    }
+
+    int id = it->id;
+    bool ytdlp    = it->isYtDlp;
+    bool playlist = it->isYtPlaylist;
+    bool startNow = !capped;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        g_items.push_back(std::move(it));
+        GuiItem* p = g_items.back().get();
+        if (startNow) {
+            p->thread.reset(new std::thread(
+                playlist ? workerYtDlpPlaylist : (ytdlp ? workerYtDlp : workerRun),
+                id));
+        }
+        emitItem(*p);
+    }
+    return id;
+}
+
+// Promote queued items to Running until maxJobs are in flight. Called after
+// each completion so the next pending download starts automatically.
+void dispatchQueued() {
+    std::vector<int> toStart;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        int running = 0;
+        for (auto& p : g_items) if (p->state == ItemState::Running) ++running;
+        int budget = g_settings.maxJobs > 0 ? (g_settings.maxJobs - running) : 999;
+        if (budget <= 0) return;
+        for (auto& p : g_items) {
+            if (p->state != ItemState::Queued) continue;
+            if (p->thread) continue; // already had a worker once (shouldn't happen)
+            toStart.push_back(p->id);
+            if ((int)toStart.size() >= budget) break;
+        }
+    }
+    for (int id : toStart) {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it || it->state != ItemState::Queued) continue;
+        it->state = ItemState::Running;
+        it->startedEpoch = (int64_t)std::time(nullptr);
+        bool ytdlp    = it->isYtDlp;
+        bool playlist = it->isYtPlaylist;
+        int  cid      = it->id;
+        it->thread.reset(new std::thread(
+            playlist ? workerYtDlpPlaylist : (ytdlp ? workerYtDlp : workerRun),
+            cid));
+        emitItem(*it);
+    }
+}
+
+int addDownload(const std::wstring& url, const std::wstring& filename,
+                const std::wstring& outDir) {
+    HandoffSpec s;
+    s.url = url; s.filename = filename; s.outDir = outDir;
+    return addDownloadEx(s);
+}
+
+void abortItem(int id) {
+    std::lock_guard<std::mutex> lk(g_itemsMu);
+    GuiItem* it = findItem(id);
+    if (!it) return;
+    if (it->dl)  it->dl->abort();
+    if (it->vg)  it->vg->abort();
+    if (it->ftp) it->ftp->abort();
+    if (it->isYtDlp) {
+        it->ytdlpAbort = true;
+        if (it->ytdlpProc) TerminateProcess(it->ytdlpProc, 1);
+    }
+}
+
+void removeItem(int id) {
+    std::unique_ptr<std::thread> th;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it) return;
+        if (it->dl)  it->dl->abort();
+        if (it->vg)  it->vg->abort();
+        if (it->ftp) it->ftp->abort();
+        if (it->isYtDlp) {
+            it->ytdlpAbort = true;
+            if (it->ytdlpProc) TerminateProcess(it->ytdlpProc, 1);
+        }
+        if (it->thread) th = std::move(it->thread);
+        auto pos = std::remove_if(g_items.begin(), g_items.end(),
+            [id](const std::unique_ptr<GuiItem>& p){ return p->id == id; });
+        g_items.erase(pos, g_items.end());
+    }
+    if (th && th->joinable()) th->detach();
+    emitItemRemoved(id);
+}
+
+void restartItem(int id) {
+    HandoffSpec spec;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it) return;
+        if (it->state == ItemState::Running) return;
+        spec.url      = it->url;
+        spec.filename = it->filename;
+        spec.outDir   = it->outDir;
+        for (auto& h : it->headers) {
+            if      (h.first == L"Referer")    spec.referer   = h.second;
+            else if (h.first == L"Cookie")     spec.cookie    = h.second;
+            else if (h.first == L"User-Agent") spec.userAgent = h.second;
+        }
+    }
+    removeItem(id);
+    addDownloadEx(spec);
+}
+
+void openInShell(const std::wstring& path, bool selectInFolder) {
+    if (path.empty()) return;
+    if (selectInFolder) {
+        // Open Explorer with the file selected.
+        std::wstring args = L"/select,\"" + path + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+    } else {
+        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+void openItemFile(int id) {
+    std::wstring p;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (it) p = it->resultPath;
+    }
+    openInShell(p, false);
+}
+
+void openItemFolder(int id) {
+    std::wstring p, dir;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(id);
+        if (!it) return;
+        p   = it->resultPath;
+        dir = it->outDir;
+    }
+    if (!p.empty()) openInShell(p, true);
+    else if (!dir.empty()) {
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+// ---- progress / completion handling on UI thread ---------------------
+
+void onProgress(ProgressMsg* m) {
+    std::unique_ptr<ProgressMsg> g(m);
+    bool changed = false;
+    GuiItem snap{};
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(m->id);
+        if (!it) return;
+        it->total       = m->total;
+        it->downloaded  = m->downloaded;
+        it->bps         = m->bps;
+        it->activeConns = m->activeConns;
+        it->segments    = m->segments;
+        if (it->state != ItemState::Running) {
+            it->state = ItemState::Running;
+            changed = true;
+        }
+        snap = GuiItem{};
+        snap.id           = it->id;
+        snap.url          = it->url;
+        snap.filename     = it->filename;
+        snap.outDir       = it->outDir;
+        snap.resultPath   = it->resultPath;
+        snap.message      = it->message;
+        snap.state        = it->state;
+        snap.total        = it->total;
+        snap.downloaded   = it->downloaded;
+        snap.bps          = it->bps;
+        snap.activeConns  = it->activeConns;
+        snap.segments     = it->segments;
+        snap.startedEpoch = it->startedEpoch;
+    }
+    (void)changed;
+    emitItem(snap);
+}
+
+void onCompleted(CompleteMsg* m) {
+    std::unique_ptr<CompleteMsg> g(m);
+    GuiItem snap{};
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        GuiItem* it = findItem(m->id);
+        if (!it) return;
+        switch (m->status) {
+            case DownloadStatus::Ok:      it->state = ItemState::Done;    break;
+            case DownloadStatus::Aborted: it->state = ItemState::Aborted; break;
+            default:                      it->state = ItemState::Err;     break;
+        }
+        it->message    = m->message;
+        it->resultPath = m->path;
+        // On success, prefer the actual file size on disk over our running
+        // counter. HLS+ffmpeg remux produces a different byte count than the
+        // sum of raw .ts segments we downloaded, and our extrapolated total
+        // for HLS is also approximate. Stat the output and use that.
+        if (it->state == ItemState::Done && !it->resultPath.empty()) {
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExW(it->resultPath.c_str(), GetFileExInfoStandard, &fad)) {
+                int64_t sz = ((int64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                if (sz > 0) {
+                    it->total      = sz;
+                    it->downloaded = sz;
+                }
+            }
+        }
+        if (it->state == ItemState::Done && it->total < 0)
+            it->total = it->downloaded;
+        snap.id           = it->id;
+        snap.url          = it->url;
+        snap.filename     = it->filename;
+        snap.outDir       = it->outDir;
+        snap.resultPath   = it->resultPath;
+        snap.message      = it->message;
+        snap.state        = it->state;
+        snap.total        = it->total;
+        snap.downloaded   = it->downloaded;
+        snap.bps          = 0;
+        snap.activeConns  = 0;
+        snap.startedEpoch = it->startedEpoch;
+    }
+    emitItem(snap);
+    if (m->status == DownloadStatus::Ok) {
+        emitToast(L"Download complete: " + (snap.filename.empty() ? snap.url : snap.filename), L"ok");
+    } else if (m->status != DownloadStatus::Aborted) {
+        emitToast(L"Download failed: " + m->message, L"err");
+    }
+    // Promote the next queued item to Running, respecting maxJobs.
+    dispatchQueued();
+}
+
+// ---- bridge: handle JS → C++ messages -------------------------------
+
+// Tiny JSON reader that handles flat object {"type":"...","key":val}.
+// Sufficient for our message surface; uses a permissive shallow parser.
+struct JsonView {
+    const wchar_t* s; size_t n;
+};
+
+void skipWs(JsonView& v, size_t& i) {
+    while (i < v.n && (v.s[i] == L' ' || v.s[i] == L'\t' || v.s[i] == L'\n' || v.s[i] == L'\r')) ++i;
+}
+bool readString(JsonView& v, size_t& i, std::wstring& out) {
+    skipWs(v, i);
+    if (i >= v.n || v.s[i] != L'"') return false;
+    ++i;
+    out.clear();
+    while (i < v.n && v.s[i] != L'"') {
+        if (v.s[i] == L'\\' && i + 1 < v.n) {
+            wchar_t c = v.s[i+1];
+            switch (c) {
+                case L'"':  out.push_back(L'"');  break;
+                case L'\\': out.push_back(L'\\'); break;
+                case L'/':  out.push_back(L'/');  break;
+                case L'n':  out.push_back(L'\n'); break;
+                case L't':  out.push_back(L'\t'); break;
+                case L'r':  out.push_back(L'\r'); break;
+                case L'u': {
+                    if (i + 5 >= v.n) return false;
+                    unsigned cp = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        wchar_t h = v.s[i+2+k]; cp <<= 4;
+                        if (h >= L'0' && h <= L'9') cp |= h - L'0';
+                        else if (h >= L'a' && h <= L'f') cp |= 10 + (h - L'a');
+                        else if (h >= L'A' && h <= L'F') cp |= 10 + (h - L'A');
+                        else return false;
+                    }
+                    out.push_back((wchar_t)cp);
+                    i += 6;
+                    continue;
+                }
+                default: return false;
+            }
+            i += 2;
+        } else {
+            out.push_back(v.s[i++]);
+        }
+    }
+    if (i >= v.n) return false;
+    ++i;
+    return true;
+}
+bool readNumber(JsonView& v, size_t& i, double& out) {
+    skipWs(v, i);
+    size_t start = i;
+    if (i < v.n && (v.s[i] == L'-' || v.s[i] == L'+')) ++i;
+    while (i < v.n && ((v.s[i] >= L'0' && v.s[i] <= L'9') || v.s[i] == L'.' || v.s[i] == L'e' || v.s[i] == L'E' || v.s[i] == L'+' || v.s[i] == L'-')) ++i;
+    if (i == start) return false;
+    std::wstring s(v.s + start, i - start);
+    out = _wtof(s.c_str());
+    return true;
+}
+bool readBool(JsonView& v, size_t& i, bool& out) {
+    skipWs(v, i);
+    if (i + 4 <= v.n && wcsncmp(v.s + i, L"true", 4) == 0) { out = true; i += 4; return true; }
+    if (i + 5 <= v.n && wcsncmp(v.s + i, L"false", 5) == 0) { out = false; i += 5; return true; }
+    return false;
+}
+bool skipValue(JsonView& v, size_t& i) {
+    skipWs(v, i);
+    if (i >= v.n) return false;
+    wchar_t c = v.s[i];
+    if (c == L'"') { std::wstring d; return readString(v, i, d); }
+    if (c == L'{' || c == L'[') {
+        wchar_t open = c, close = (c == L'{') ? L'}' : L']';
+        int depth = 0;
+        while (i < v.n) {
+            wchar_t x = v.s[i];
+            if (x == L'"') { std::wstring d; if (!readString(v, i, d)) return false; continue; }
+            if (x == open)  { ++depth; ++i; continue; }
+            if (x == close) { --depth; ++i; if (depth == 0) return true; continue; }
+            ++i;
+        }
+        return false;
+    }
+    while (i < v.n && v.s[i] != L',' && v.s[i] != L'}' && v.s[i] != L']' &&
+           v.s[i] != L' ' && v.s[i] != L'\t' && v.s[i] != L'\n' && v.s[i] != L'\r') ++i;
+    return true;
+}
+
+struct ParsedMsg {
+    std::wstring type;
+    std::wstring url, filename, outDir;
+    int          id = 0;
+    bool         hasSettings = false;
+    Settings     settings;
+};
+
+bool parseMessage(const std::wstring& json, ParsedMsg& m) {
+    JsonView v{ json.c_str(), json.size() };
+    size_t i = 0;
+    skipWs(v, i);
+    if (i >= v.n || v.s[i] != L'{') return false;
+    ++i;
+    while (true) {
+        skipWs(v, i);
+        if (i >= v.n) break;
+        if (v.s[i] == L'}') { ++i; break; }
+        std::wstring key;
+        if (!readString(v, i, key)) break;
+        skipWs(v, i);
+        if (i >= v.n || v.s[i] != L':') break;
+        ++i;
+        skipWs(v, i);
+        if (key == L"type")     { if (!readString(v, i, m.type))     break; }
+        else if (key == L"url")     { if (!readString(v, i, m.url))     break; }
+        else if (key == L"filename"){ if (!readString(v, i, m.filename))break; }
+        else if (key == L"outDir")  { if (!readString(v, i, m.outDir))  break; }
+        else if (key == L"id")      { double d=0; if (!readNumber(v, i, d)) break; m.id = (int)d; }
+        else if (key == L"settings") {
+            // Parse nested settings object.
+            skipWs(v, i);
+            if (i >= v.n || v.s[i] != L'{') { skipValue(v, i); }
+            else {
+                ++i;
+                while (true) {
+                    skipWs(v, i);
+                    if (i >= v.n) break;
+                    if (v.s[i] == L'}') { ++i; break; }
+                    std::wstring sk;
+                    if (!readString(v, i, sk)) break;
+                    skipWs(v, i);
+                    if (i >= v.n || v.s[i] != L':') break;
+                    ++i;
+                    skipWs(v, i);
+                    if (sk == L"outDir")          { readString(v, i, m.settings.outputDir); }
+                    else if (sk == L"connections")    { double d=0; readNumber(v, i, d); m.settings.connections = (int)d; }
+                    else if (sk == L"maxJobs")        { double d=0; readNumber(v, i, d); m.settings.maxJobs = (int)d; }
+                    else if (sk == L"bandwidthBps")   { double d=0; readNumber(v, i, d); m.settings.bandwidthBps = (int64_t)d; }
+                    else if (sk == L"clipboardWatch") { bool b=false; readBool(v, i, b); m.settings.clipboardWatch = b; }
+                    else if (sk == L"verifyChecksum") { bool b=true;  readBool(v, i, b); m.settings.verifyChecksum = b; }
+                    else if (sk == L"categorize")     { bool b=false; readBool(v, i, b); m.settings.categorize = b; }
+                    else                              { skipValue(v, i); }
+                    skipWs(v, i);
+                    if (i < v.n && v.s[i] == L',') { ++i; continue; }
+                }
+                m.hasSettings = true;
+            }
+        }
+        else                        { skipValue(v, i); }
+        skipWs(v, i);
+        if (i < v.n && v.s[i] == L',') { ++i; continue; }
+    }
+    return true;
+}
+
+void handleMessage(const std::wstring& json) {
+    ParsedMsg m;
+    if (!parseMessage(json, m)) return;
+
+    if      (m.type == L"ready") {
+        emitItemsSnapshot();
+        emitSettings();
+    }
+    else if (m.type == L"addDownload") {
+        if (!m.url.empty()) addDownload(m.url, m.filename, m.outDir);
+    }
+    else if (m.type == L"pause" || m.type == L"abort") {
+        abortItem(m.id);
+    }
+    else if (m.type == L"resume" || m.type == L"restart") {
+        restartItem(m.id);
+    }
+    else if (m.type == L"remove") {
+        removeItem(m.id);
+    }
+    else if (m.type == L"openFile") {
+        openItemFile(m.id);
+    }
+    else if (m.type == L"openFolder") {
+        openItemFolder(m.id);
+    }
+    else if (m.type == L"redownload") {
+        // IDM-parity: re-fetch the same URL from scratch. Capture the spec
+        // off the existing item, drop the row, then re-add as a new item.
+        HandoffSpec spec;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMu);
+            GuiItem* it = findItem(m.id);
+            if (it) {
+                spec.url      = it->url;
+                spec.filename = it->filename;
+                spec.outDir   = it->outDir;
+                for (auto& kv : it->headers) {
+                    if      (_wcsicmp(kv.first.c_str(), L"Referer") == 0)    spec.referer   = kv.second;
+                    else if (_wcsicmp(kv.first.c_str(), L"Cookie") == 0)     spec.cookie    = kv.second;
+                    else if (_wcsicmp(kv.first.c_str(), L"User-Agent") == 0) spec.userAgent = kv.second;
+                }
+                spec.ytFormat = it->ytFormat;
+                found = true;
+            }
+        }
+        if (found) {
+            removeItem(m.id);
+            addDownloadEx(spec);
+        }
+    }
+    else if (m.type == L"setSettings") {
+        if (m.hasSettings) {
+            g_settings.outputDir       = m.settings.outputDir;
+            g_settings.connections     = m.settings.connections > 0 ? m.settings.connections : 8;
+            g_settings.maxJobs         = m.settings.maxJobs > 0 ? m.settings.maxJobs : 3;
+            g_settings.bandwidthBps    = m.settings.bandwidthBps;
+            g_settings.clipboardWatch  = m.settings.clipboardWatch;
+            g_settings.verifyChecksum  = m.settings.verifyChecksum;
+            g_settings.categorize      = m.settings.categorize;
+            saveSettings();
+            emitSettings();
+            emitToast(L"Settings saved", L"ok");
+            // If the user raised maxJobs, kick the queue.
+            dispatchQueued();
+        }
+    }
+    else if (m.type == L"pauseAll") {
+        std::vector<int> ids;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMu);
+            for (auto& it : g_items)
+                if (it->state == ItemState::Running) ids.push_back(it->id);
+        }
+        for (int id : ids) abortItem(id);
+    }
+    else if (m.type == L"resumeAll") {
+        std::vector<int> ids;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMu);
+            for (auto& it : g_items)
+                if (it->state == ItemState::Aborted || it->state == ItemState::Err) ids.push_back(it->id);
+        }
+        for (int id : ids) restartItem(id);
+    }
+    else if (m.type == L"win.minimize") {
+        ShowWindow(g_hwnd, SW_MINIMIZE);
+    }
+    else if (m.type == L"win.toggleMaximize") {
+        if (IsZoomed(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
+        else                  ShowWindow(g_hwnd, SW_MAXIMIZE);
+    }
+    else if (m.type == L"win.close") {
+        DestroyWindow(g_hwnd);
+    }
+}
+
+// ---- WebView2 setup --------------------------------------------------
+
+std::wstring exeDir() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0) return L"";
+    std::wstring p(buf, n);
+    auto slash = p.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? L"" : p.substr(0, slash);
+}
+
+std::wstring uiDir() {
+    // ui/ next to the exe (installed) or one level up under matata\ui\ in the
+    // dev tree (build\ → ..\ui\). Try both.
+    std::wstring base = exeDir();
+    std::wstring tryA = base + L"\\ui";
+    if (GetFileAttributesW(tryA.c_str()) != INVALID_FILE_ATTRIBUTES) return tryA;
+    std::wstring tryB = base + L"\\..\\ui";
+    if (GetFileAttributesW(tryB.c_str()) != INVALID_FILE_ATTRIBUTES) return tryB;
+    return tryA; // fall through; navigation will fail noisily
+}
+
+std::wstring userDataDir() {
+    wchar_t buf[MAX_PATH];
+    if (SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf) == S_OK) {
+        std::wstring p = buf;
+        p += L"\\matata\\webview2";
+        SHCreateDirectoryExW(nullptr, p.c_str(), nullptr);
+        return p;
+    }
+    return L"";
+}
+
+void initWebView2() {
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, userDataDir().c_str(), nullptr,
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                if (!env) {
+                    MessageBoxW(g_hwnd,
+                        L"Failed to create WebView2 environment.\n\n"
+                        L"matata needs the Microsoft Edge WebView2 Runtime.\n"
+                        L"It ships with Windows 11 and recent Windows 10 builds.\n"
+                        L"Get it from: https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+                        L"matata", MB_OK | MB_ICONERROR);
+                    DestroyWindow(g_hwnd);
+                    return S_OK;
+                }
+                env->CreateCoreWebView2Controller(g_hwnd,
+                    Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                        [](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+                            if (!controller) {
+                                DestroyWindow(g_hwnd);
+                                return S_OK;
+                            }
+                            g_controller = controller;
+                            g_controller->get_CoreWebView2(&g_webview);
+
+                            RECT rc; GetClientRect(g_hwnd, &rc);
+                            g_controller->put_Bounds(rc);
+
+                            // Map the virtual host to ui/ folder.
+                            ComPtr<ICoreWebView2_3> wv3;
+                            if (SUCCEEDED(g_webview.As(&wv3))) {
+                                wv3->SetVirtualHostNameToFolderMapping(
+                                    kVirtualHost,
+                                    uiDir().c_str(),
+                                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+                            }
+
+                            // Trim chrome: hide context menu / dev tools in release.
+                            ComPtr<ICoreWebView2Settings> settings;
+                            g_webview->get_Settings(&settings);
+                            if (settings) {
+                                settings->put_AreDefaultContextMenusEnabled(FALSE);
+                                settings->put_IsStatusBarEnabled(FALSE);
+                                settings->put_AreDevToolsEnabled(FALSE);
+                                settings->put_IsZoomControlEnabled(FALSE);
+                            }
+
+                            // Wire JS → C++ message bridge.
+                            EventRegistrationToken token;
+                            g_webview->add_WebMessageReceived(
+                                Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                    [](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                        LPWSTR raw = nullptr;
+                                        if (SUCCEEDED(args->TryGetWebMessageAsString(&raw)) && raw) {
+                                            handleMessage(std::wstring(raw));
+                                            CoTaskMemFree(raw);
+                                        }
+                                        return S_OK;
+                                    }).Get(),
+                                &token);
+
+                            g_webview->Navigate((std::wstring(L"https://") + kVirtualHost + L"/index.html").c_str());
+
+                            g_webviewReady = true;
+                            // Flush anything queued before WebView was ready.
+                            for (auto& s : g_pendingScripts) g_webview->ExecuteScript(s.c_str(), nullptr);
+                            g_pendingScripts.clear();
+                            return S_OK;
+                        }).Get());
+                return S_OK;
+            }).Get());
+    if (FAILED(hr)) {
+        MessageBoxW(g_hwnd,
+            L"WebView2 runtime not found.\n\n"
+            L"Install it from: https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+            L"matata", MB_OK | MB_ICONERROR);
+        DestroyWindow(g_hwnd);
+    }
+}
+
+// ---- main window proc ------------------------------------------------
+
+LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_SIZE: {
+        if (g_controller) {
+            RECT rc; GetClientRect(hwnd, &rc);
+            g_controller->put_Bounds(rc);
+        }
+        return 0;
+    }
+    case WM_MOVE:
+    case WM_EXITSIZEMOVE: {
+        WINDOWPLACEMENT wp_{}; wp_.length = sizeof(wp_);
+        if (GetWindowPlacement(hwnd, &wp_)) {
+            g_settings.windowMaximized = (wp_.showCmd == SW_SHOWMAXIMIZED);
+            RECT& r = wp_.rcNormalPosition;
+            g_settings.windowX = r.left;
+            g_settings.windowY = r.top;
+            g_settings.windowW = r.right  - r.left;
+            g_settings.windowH = r.bottom - r.top;
+        }
+        return 0;
+    }
+    case WM_APP_BRIDGE_EVENT: {
+        std::unique_ptr<std::wstring> p((std::wstring*)lp);
+        executeOnUi(*p);
+        return 0;
+    }
+    case WM_APP_PROGRESS: {
+        onProgress((ProgressMsg*)lp);
+        return 0;
+    }
+    case WM_APP_COMPLETED: {
+        onCompleted((CompleteMsg*)lp);
+        return 0;
+    }
+    case WM_APP_UPDATE_AVAIL: {
+        onUpdateAvailable((UpdateAvailMsg*)lp);
+        return 0;
+    }
+    case WM_COPYDATA: {
+        auto cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
+        if (!cds || cds->dwData != kHandoffMagic) return 0;
+        if (cds->cbData == 0 || cds->cbData % sizeof(wchar_t) != 0) return 0;
+        HandoffSpec s = deserializeHandoff(
+            reinterpret_cast<const wchar_t*>(cds->lpData),
+            cds->cbData / sizeof(wchar_t));
+        dbgLog(L"WM_COPYDATA url=[%ls]", s.url.c_str());
+        if (s.url.empty()) return 0;
+        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        addDownloadEx(s);
+        return TRUE;
+    }
+    case WM_DESTROY: {
+        saveSettings();
+        // Tell every worker to stop; detach so we don't block teardown.
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        for (auto& it : g_items) {
+            if (it->dl)  it->dl->abort();
+            if (it->vg)  it->vg->abort();
+            if (it->ftp) it->ftp->abort();
+            if (it->isYtDlp) {
+                it->ytdlpAbort = true;
+                if (it->ytdlpProc) TerminateProcess(it->ytdlpProc, 1);
+            }
+            if (it->thread && it->thread->joinable()) it->thread->detach();
+        }
+        PostQuitMessage(0);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+} // anon
+
+// ---- entry point -----------------------------------------------------
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/) {
+    g_hInst = hInst;
+    dbgLog(L"wWinMain ENTER cmdLine=[%ls]", cmdLine ? cmdLine : L"(null)");
+
+    HandoffSpec cliSpec;
+    bool haveCli = parseHandoffArgs(cmdLine, cliSpec);
+    dbgLog(L"parsed haveCli=%d url=[%ls] filename=[%ls]",
+           (int)haveCli, cliSpec.url.c_str(), cliSpec.filename.c_str());
+
+    g_instanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutex);
+    bool already = (GetLastError() == ERROR_ALREADY_EXISTS);
+    if (already) {
+        if (haveCli) {
+            forwardHandoffToExistingInstance(cliSpec);
+        } else {
+            HWND target = FindWindowW(kClassName, nullptr);
+            if (target) {
+                if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+                else                  ShowWindow(target, SW_SHOW);
+                SetForegroundWindow(target);
+            }
+        }
+        if (g_instanceMutex) CloseHandle(g_instanceMutex);
+        return 0;
+    }
+
+    OleInitialize(nullptr);
+    loadSettings();
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = MainWndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kClassName;
+    wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIconSm       = LoadIconW(nullptr, IDI_APPLICATION);
+    RegisterClassExW(&wc);
+
+    g_hwnd = CreateWindowExW(0, kClassName, kAppTitle,
+        WS_OVERLAPPEDWINDOW,
+        g_settings.windowX, g_settings.windowY,
+        g_settings.windowW, g_settings.windowH,
+        nullptr, nullptr, hInst, nullptr);
+    if (!g_hwnd) return 1;
+
+    ShowWindow(g_hwnd, g_settings.windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+    UpdateWindow(g_hwnd);
+
+    initWebView2();
+
+    // Kick off a one-shot background update check. Runs once per launch;
+    // posts WM_APP_UPDATE_AVAIL back to the UI thread if a newer version
+    // is published. Detached so we don't have to track the thread handle
+    // through teardown -- worst case the HTTP fetch is a few KB and
+    // returns within seconds.
+    std::thread(updateCheckWorker).detach();
+
+    if (haveCli) {
+        // Add now; if WebView is still initializing, the item event will be
+        // queued and flushed once ready.
+        addDownloadEx(cliSpec);
+    }
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    g_webview.Reset();
+    g_controller.Reset();
+    OleUninitialize();
+    if (g_instanceMutex) { ReleaseMutex(g_instanceMutex); CloseHandle(g_instanceMutex); }
+    return (int)msg.wParam;
+}

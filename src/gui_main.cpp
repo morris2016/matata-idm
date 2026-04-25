@@ -669,8 +669,131 @@ int64_t scheduleToEpoch(const std::wstring& hhmm) {
     return (int64_t)target;
 }
 
+// ---- handoff from extension / second instance ------------------------
+
+struct HandoffSpec {
+    std::wstring url;
+    std::wstring filename;
+    std::wstring outDir;
+    std::wstring referer;
+    std::wstring cookie;
+    std::wstring userAgent;
+};
+
+// WM_COPYDATA magic so we don't accidentally accept payloads from unrelated
+// apps that happen to find our window class.
+constexpr ULONG_PTR kHandoffMagic    = 0x4D415441; // 'MATA'
+constexpr wchar_t   kInstanceMutex[] = L"Local\\com.matata.gui.singleton";
+
+std::wstring serializeHandoff(const HandoffSpec& s) {
+    std::wstring out;
+    auto put = [&](const wchar_t* key, const std::wstring& val) {
+        if (val.empty()) return;
+        out.append(key);
+        out.push_back(L'\0');
+        out.append(val);
+        out.push_back(L'\0');
+    };
+    put(L"url",       s.url);
+    put(L"filename",  s.filename);
+    put(L"outDir",    s.outDir);
+    put(L"referer",   s.referer);
+    put(L"cookie",    s.cookie);
+    put(L"userAgent", s.userAgent);
+    return out;
+}
+
+HandoffSpec deserializeHandoff(const wchar_t* data, size_t count) {
+    HandoffSpec s;
+    size_t i = 0;
+    auto readField = [&](std::wstring& out) -> bool {
+        size_t start = i;
+        while (i < count && data[i] != L'\0') ++i;
+        if (i >= count) return false;
+        out.assign(data + start, i - start);
+        ++i; // skip NUL
+        return true;
+    };
+    while (i < count) {
+        std::wstring key, val;
+        if (!readField(key)) break;
+        if (!readField(val)) break;
+        if      (key == L"url")       s.url = std::move(val);
+        else if (key == L"filename")  s.filename = std::move(val);
+        else if (key == L"outDir")    s.outDir = std::move(val);
+        else if (key == L"referer")   s.referer = std::move(val);
+        else if (key == L"cookie")    s.cookie = std::move(val);
+        else if (key == L"userAgent") s.userAgent = std::move(val);
+    }
+    return s;
+}
+
+bool parseHandoffArgs(PWSTR cmdLine, HandoffSpec& out) {
+    if (!cmdLine || !*cmdLine) return false;
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(cmdLine, &argc);
+    if (!argv) return false;
+    auto next = [&](int& i, std::wstring& dst) {
+        if (i + 1 < argc) dst = argv[++i];
+    };
+    for (int i = 0; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if      (a == L"--add-url")    next(i, out.url);
+        else if (a == L"--filename")   next(i, out.filename);
+        else if (a == L"--out-dir")    next(i, out.outDir);
+        else if (a == L"--referer")    next(i, out.referer);
+        else if (a == L"--cookie")     next(i, out.cookie);
+        else if (a == L"--user-agent") next(i, out.userAgent);
+        else if (out.url.empty()) {
+            // Bare URL / matata:// URL (backward compat).
+            if (a.size() > 9 && a.compare(0, 9, L"matata://") == 0)
+                out.url = a.substr(9);
+            else if (a.compare(0, 7, L"http://")  == 0 ||
+                     a.compare(0, 8, L"https://") == 0 ||
+                     a.compare(0, 6, L"ftp://")   == 0 ||
+                     a.compare(0, 7, L"ftps://")  == 0)
+                out.url = a;
+        }
+    }
+    LocalFree(argv);
+    // Trim stray quotes left over from odd callers.
+    auto trimQuotes = [](std::wstring& s) {
+        while (!s.empty() && (s.front() == L'"' || s.front() == L' ')) s.erase(s.begin());
+        while (!s.empty() && (s.back()  == L'"' || s.back()  == L' ')) s.pop_back();
+    };
+    trimQuotes(out.url);
+    trimQuotes(out.filename);
+    trimQuotes(out.outDir);
+    trimQuotes(out.referer);
+    trimQuotes(out.cookie);
+    trimQuotes(out.userAgent);
+    return !out.url.empty();
+}
+
+bool forwardHandoffToExistingInstance(const HandoffSpec& spec) {
+    HWND target = FindWindowW(kClassName, nullptr);
+    if (!target) return false;
+
+    std::wstring blob = serializeHandoff(spec);
+    COPYDATASTRUCT cds{};
+    cds.dwData = kHandoffMagic;
+    cds.cbData = (DWORD)(blob.size() * sizeof(wchar_t));
+    cds.lpData = (PVOID)blob.data();
+
+    // Nudge the existing window forward so the user sees it come up.
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    ShowWindow(target, SW_SHOW);
+    SetForegroundWindow(target);
+
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(target, WM_COPYDATA, 0, (LPARAM)&cds,
+                        SMTO_ABORTIFHUNG, 5000, &result);
+    return true;
+}
+
 int addDownload(const std::wstring& url, const std::wstring& filename,
-                const std::wstring& outDir) {
+                const std::wstring& outDir,
+                const std::vector<std::pair<std::wstring,std::wstring>>& headers = {}) {
     if (url.empty()) return 0;
     auto it = std::make_unique<GuiItem>();
     it->id       = g_nextId.fetch_add(1);
@@ -695,12 +818,14 @@ int addDownload(const std::wstring& url, const std::wstring& filename,
         vo.outputDir  = it->outDir;
         vo.outputName = filename;
         vo.quality    = L"best";
+        vo.headers    = headers;
         it->vg = std::make_shared<VideoGrabber>(url, vo);
     } else if (it->isFtp) {
         DownloadOptions dlo;
         dlo.outputDir    = it->outDir;
         dlo.outputName   = filename;
         dlo.bandwidthBps = g_settings.bandwidthBps;
+        dlo.headers      = headers;
         it->ftp = std::make_shared<FtpDownloader>(url, dlo);
     } else {
         DownloadOptions dlo;
@@ -709,6 +834,7 @@ int addDownload(const std::wstring& url, const std::wstring& filename,
         dlo.connections    = g_settings.connections;
         dlo.bandwidthBps   = g_settings.bandwidthBps;
         dlo.verifyChecksum = g_settings.verifyChecksum;
+        dlo.headers        = headers;
         it->dl = std::make_shared<Downloader>(url, dlo);
     }
 
@@ -747,6 +873,14 @@ int addDownload(const std::wstring& url, const std::wstring& filename,
     }
     updateStatusBar();
     return id;
+}
+
+int addDownloadFromHandoff(const HandoffSpec& s) {
+    std::vector<std::pair<std::wstring,std::wstring>> headers;
+    if (!s.referer.empty())   headers.push_back({L"Referer",    s.referer});
+    if (!s.cookie.empty())    headers.push_back({L"Cookie",     s.cookie});
+    if (!s.userAgent.empty()) headers.push_back({L"User-Agent", s.userAgent});
+    return addDownload(s.url, s.filename, s.outDir, headers);
 }
 
 void abortItem(int id) {
@@ -1776,6 +1910,20 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    case WM_COPYDATA: {
+        auto cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
+        if (!cds || cds->dwData != kHandoffMagic) return 0;
+        if (cds->cbData == 0 || cds->cbData % sizeof(wchar_t) != 0) return 0;
+        HandoffSpec s = deserializeHandoff(
+            reinterpret_cast<const wchar_t*>(cds->lpData),
+            cds->cbData / sizeof(wchar_t));
+        if (s.url.empty()) return 0;
+        if (IsIconic(hwnd))       ShowWindow(hwnd, SW_RESTORE);
+        else if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        addDownloadFromHandoff(s);
+        return TRUE;
+    }
     case WM_CLIPBOARDUPDATE: {
         if (!g_clipWatchEnabled) return 0;
         std::wstring u = readClipboardUrl(hwnd);
@@ -1839,6 +1987,37 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     g_hInst = hInst;
 
+    // Parse the command line into a handoff spec up front. Same format is
+    // used by CommandLineToArgvW invocation and by WM_COPYDATA payloads.
+    HandoffSpec cliSpec;
+    bool haveCliUrl = parseHandoffArgs(cmdLine, cliSpec);
+
+    // Single-instance gate. If another matata-gui is running, forward the
+    // spec to it (so the user sees the existing window, not a new one).
+    HANDLE hInstanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutex);
+    bool alreadyRunning = (GetLastError() == ERROR_ALREADY_EXISTS);
+    if (alreadyRunning) {
+        if (haveCliUrl) {
+            if (!forwardHandoffToExistingInstance(cliSpec)) {
+                // Existing window not found — shouldn't happen given the
+                // mutex, but fall through and run normally in that case.
+                alreadyRunning = false;
+            }
+        } else {
+            // No handoff — just bring the running window forward and exit.
+            HWND target = FindWindowW(kClassName, nullptr);
+            if (target) {
+                if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+                else                  ShowWindow(target, SW_SHOW);
+                SetForegroundWindow(target);
+            }
+        }
+        if (alreadyRunning) {
+            if (hInstanceMutex) CloseHandle(hInstanceMutex);
+            return 0;
+        }
+    }
+
     // Load persisted settings BEFORE the main window is created so we
     // can honor the saved size/position.
     loadSettings();
@@ -1884,17 +2063,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     ShowWindow(g_hwnd, g_settings.windowMaximized ? SW_SHOWMAXIMIZED : nCmdShow);
     UpdateWindow(g_hwnd);
 
-    // If a URL was passed on the command line, queue it immediately.
-    if (cmdLine && *cmdLine) {
-        std::wstring u = cmdLine;
-        // Strip surrounding quotes if any.
-        while (!u.empty() && (u.front() == L' ' || u.front() == L'"')) u.erase(u.begin());
-        while (!u.empty() && (u.back()  == L' ' || u.back()  == L'"')) u.pop_back();
-        // Handle matata://URL scheme by stripping the prefix.
-        if (u.size() > 9 && u.compare(0, 9, L"matata://") == 0) {
-            u = u.substr(9);
-        }
-        if (!u.empty()) addDownload(u, L"", L"");
+    // If a URL / handoff spec was passed on the command line, queue it.
+    if (haveCliUrl) {
+        addDownloadFromHandoff(cliSpec);
     }
 
     MSG msg;
@@ -1913,5 +2084,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
         }
     }
     OleUninitialize();
+    if (hInstanceMutex) { ReleaseMutex(hInstanceMutex); CloseHandle(hInstanceMutex); }
     return (int)msg.wParam;
 }

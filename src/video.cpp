@@ -252,14 +252,29 @@ void segmentWorker(SegPool* pool) {
 
         std::string body;
         int status = 0;
-        for (int attempt = 0; attempt < kSegmentRetries; ++attempt) {
+        // Total retry budget — HLS CDNs (e.g. neonhorizonworkshops, Vimeo)
+        // start serving 429 after a couple hundred segments at 8x parallel.
+        // We need to ride the rate-limit out, not give up after 3 quick
+        // retries. 8 attempts with exponential backoff lets a single
+        // segment recover from up to ~30s of cooldown.
+        constexpr int kMaxAttempts = 8;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
             if (pool->abortFlag && pool->abortFlag->load()) break;
             body.clear();
             err.clear();
             status = httpFetchBody(u, *pool->headers, body, err, 512ull * 1024ull * 1024ull);
             if (status >= 200 && status < 300 && !body.empty()) break;
-            // backoff
-            Sleep(300 * (1 << attempt));
+            // 429 = rate limited. Sleep dramatically longer than for other
+            // errors so the entire pool naturally backs off (every worker
+            // hitting 429 will be sleeping at the same time, giving the CDN
+            // a full break instead of a steady stream of fresh requests).
+            DWORD ms;
+            if (status == 429) {
+                ms = (DWORD)(1500 * (1 << std::min(attempt, 5))); // 1.5s..48s
+            } else {
+                ms = (DWORD)(300 * (1 << std::min(attempt, 4)));  // 0.3s..4.8s
+            }
+            Sleep(ms);
         }
         if (status < 200 || status >= 300 || body.empty()) {
             std::wostringstream s;

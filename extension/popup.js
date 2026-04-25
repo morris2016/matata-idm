@@ -9,7 +9,9 @@ const DEFAULTS = {
   enabled: true,
   minSize: 1048576,
   extensions: DEFAULT_EXTS,
-  outDir: ""
+  outDir: "",
+  confirmEach: true,
+  skipExts: []
 };
 
 const $ = (id) => document.getElementById(id);
@@ -18,19 +20,25 @@ async function load() {
   const stored = await chrome.storage.local.get(["settings"]);
   const s = { ...DEFAULTS, ...(stored.settings || {}) };
   $("enabled").checked = !!s.enabled;
+  $("confirmEach").checked = s.confirmEach !== false;
   $("minSize").value = s.minSize;
   $("extensions").value = (s.extensions || []).join(", ");
   $("outDir").value = s.outDir || "";
+  $("skipExts").value = (s.skipExts || []).join(", ");
 }
 
 async function save() {
   const extList = $("extensions").value
     .split(/[,\s]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+  const skipList = $("skipExts").value
+    .split(/[,\s]+/).map(x => x.trim().toLowerCase().replace(/^\./, "")).filter(Boolean);
   const settings = {
-    enabled:    $("enabled").checked,
-    minSize:    Math.max(0, parseInt($("minSize").value, 10) || 0),
-    extensions: extList,
-    outDir:     $("outDir").value.trim()
+    enabled:     $("enabled").checked,
+    confirmEach: $("confirmEach").checked,
+    minSize:     Math.max(0, parseInt($("minSize").value, 10) || 0),
+    extensions:  extList,
+    outDir:      $("outDir").value.trim(),
+    skipExts:    skipList
   };
   await chrome.storage.local.set({ settings });
   const s = $("saveStatus");
@@ -130,6 +138,84 @@ async function refreshJobs() {
   }
 }
 
+function fmtFormatLabel(f) {
+  const parts = [];
+  if (f.height) parts.push(f.height + "p" + (f.fps && f.fps !== 30 ? f.fps : ""));
+  else if (f.quality) parts.push(f.quality);
+  if (f.codecs) {
+    const c = f.codecs.split(",")[0].trim();
+    if (c) parts.push(c.split(".")[0]);
+  } else if (f.container) {
+    parts.push(f.container);
+  }
+  if (f.isAudio && !f.isVideo) {
+    parts.unshift("audio");
+    if (f.audioBitrate) parts.push(Math.round(f.audioBitrate/1000) + "k");
+  }
+  if (f.contentLength) {
+    parts.push(fmtBytes(f.contentLength));
+  } else if (f.bitrate) {
+    parts.push(Math.round(f.bitrate/1000) + " kbps");
+  }
+  return parts.join(" · ");
+}
+
+function suggestFilename(meta, fmt) {
+  const safe = (meta.title || "video").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 120);
+  const ext = fmt.container || (fmt.mimeType || "").split("/")[1] || "mp4";
+  return `${safe}.${ext}`;
+}
+
+async function refreshYoutube() {
+  const panel = $("ytPanel");
+  const r = await sendBg({ action: "list-page-formats" });
+  const data = (r && r.ok) ? r.data : null;
+  if (!data || !data.formats || data.formats.length === 0) {
+    panel.style.display = "none";
+    return;
+  }
+  panel.style.display = "block";
+  $("ytTitle").textContent = data.title || "(unknown)";
+  $("ytTitle").title = data.title || "";
+  const sel = $("ytQuality");
+  sel.innerHTML = "";
+  for (const f of data.formats) {
+    const opt = document.createElement("option");
+    opt.value = JSON.stringify({
+      url: f.url,
+      filename: suggestFilename(data, f),
+      referer: data.pageUrl || ""
+    });
+    opt.textContent = fmtFormatLabel(f);
+    sel.appendChild(opt);
+  }
+}
+
+async function grabYoutube() {
+  const sel = $("ytQuality");
+  if (!sel.value) return;
+  let chosen;
+  try { chosen = JSON.parse(sel.value); } catch { return; }
+  const outDir = $("outDir").value.trim();
+  const status = $("ytStatus");
+  status.textContent = "queued...";
+  status.className = "muted";
+  const r = await sendBg({
+    action:   "grab-format",
+    url:      chosen.url,
+    filename: chosen.filename,
+    referer:  chosen.referer,
+    outDir
+  });
+  if (r && r.ok) {
+    status.className = "ok";
+    status.textContent = "queued: " + chosen.filename;
+  } else {
+    status.className = "err";
+    status.textContent = "err: " + (r && r.err || "unknown");
+  }
+}
+
 async function refreshSniffed() {
   const container = $("sniffList");
   const r = await sendBg({ action: "list-sniffed" });
@@ -172,11 +258,14 @@ async function refreshSniffed() {
 
 document.addEventListener("DOMContentLoaded", () => {
   load();
+  refreshYoutube();
   refreshSniffed();
   refreshJobs();
   // Keep the active-downloads list fresh while the popup is open.
   setInterval(refreshJobs, 600);
+  setInterval(refreshYoutube, 1500);
   $("save").addEventListener("click", save);
   $("send").addEventListener("click", sendManual);
   $("ping").addEventListener("click", ping);
+  $("ytGrab").addEventListener("click", grabYoutube);
 });

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>matata</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="titlebar">
+  <div class="titlebar-drag">
+    <div class="brand">
+      <div class="logo"></div>
+      <span class="brand-name">matata</span>
+    </div>
+    <div class="search-wrap">
+      <svg class="search-icon" viewBox="0 0 16 16"><path d="M11 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zm-.7 3.3 3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <input id="search" type="text" placeholder="Search downloads">
+    </div>
+  </div>
+  <div class="titlebar-actions">
+    <button class="ic-btn" id="btnPauseAll" title="Pause all"><svg viewBox="0 0 16 16"><rect x="4" y="3" width="3" height="10" rx="1" fill="currentColor"/><rect x="9" y="3" width="3" height="10" rx="1" fill="currentColor"/></svg></button>
+    <button class="ic-btn" id="btnResumeAll" title="Resume all"><svg viewBox="0 0 16 16"><path d="M5 3l8 5-8 5z" fill="currentColor"/></svg></button>
+    <button class="ic-btn" id="btnSettings" title="Settings"><svg viewBox="0 0 16 16"><path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM7 .5h2l.4 1.7a6 6 0 0 1 1.5.6l1.5-1L13.8 3l-1 1.5a6 6 0 0 1 .6 1.5l1.7.4v2l-1.7.4a6 6 0 0 1-.6 1.5l1 1.5-1.4 1.4-1.5-1a6 6 0 0 1-1.5.6L9 15.5H7l-.4-1.7a6 6 0 0 1-1.5-.6l-1.5 1L2.2 13l1-1.5a6 6 0 0 1-.6-1.5L.9 9.6v-2l1.7-.4a6 6 0 0 1 .6-1.5l-1-1.5L3.6 2.8l1.5 1a6 6 0 0 1 1.5-.6L7 .5z" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
+    <span class="win-controls">
+      <button class="win-btn" id="winMin" title="Minimize"><svg viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1"/></svg></button>
+      <button class="win-btn" id="winMax" title="Maximize"><svg viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/></svg></button>
+      <button class="win-btn win-close" id="winClose" title="Close"><svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.2"/></svg></button>
+    </span>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="add-split">
+      <button class="add-btn add-main" id="btnAdd">
+        <svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        Add download
+      </button>
+      <button class="add-btn add-batch" id="btnBatch" title="Batch download (multiple URLs)">
+        <svg viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <nav class="cats" id="cats">
+      <div class="cat-item active" data-cat="all">
+        <span class="cat-icon">▣</span><span class="cat-label">All downloads</span><span class="cat-count" id="cntAll">0</span>
+      </div>
+      <div class="cat-section">By category</div>
+      <div class="cat-item" data-cat="compressed"><span class="cat-icon">📦</span><span class="cat-label">Compressed</span><span class="cat-count" id="cntCompressed">0</span></div>
+      <div class="cat-item" data-cat="documents"><span class="cat-icon">📄</span><span class="cat-label">Documents</span><span class="cat-count" id="cntDocuments">0</span></div>
+      <div class="cat-item" data-cat="music"><span class="cat-icon">♪</span><span class="cat-label">Music</span><span class="cat-count" id="cntMusic">0</span></div>
+      <div class="cat-item" data-cat="programs"><span class="cat-icon">⚙</span><span class="cat-label">Programs</span><span class="cat-count" id="cntPrograms">0</span></div>
+      <div class="cat-item" data-cat="video"><span class="cat-icon">▶</span><span class="cat-label">Video</span><span class="cat-count" id="cntVideo">0</span></div>
+      <div class="cat-section">By status</div>
+      <div class="cat-item" data-cat="running"><span class="cat-icon">↓</span><span class="cat-label">Active</span><span class="cat-count" id="cntRunning">0</span></div>
+      <div class="cat-item" data-cat="queued"><span class="cat-icon">⏱</span><span class="cat-label">Queued</span><span class="cat-count" id="cntQueued">0</span></div>
+      <div class="cat-item" data-cat="done"><span class="cat-icon">✓</span><span class="cat-label">Finished</span><span class="cat-count" id="cntDone">0</span></div>
+      <div class="cat-item" data-cat="err"><span class="cat-icon">!</span><span class="cat-label">Failed</span><span class="cat-count" id="cntErr">0</span></div>
+    </nav>
+  </aside>
+
+  <section class="content">
+    <div class="empty-state" id="emptyState">
+      <div class="empty-art">
+        <svg viewBox="0 0 120 120">
+          <circle cx="60" cy="60" r="48" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2"/>
+          <path d="M60 35v40m-15-15 15 15 15-15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <h2>No downloads yet</h2>
+      <p>Drop a URL here, paste from clipboard, or click <strong>Add download</strong>.</p>
+    </div>
+    <div class="rows" id="rows"></div>
+  </section>
+</main>
+
+<!-- Add URL modal -->
+<div class="modal-backdrop" id="addModal" hidden>
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Add download</h3>
+      <button class="ic-btn" data-close="addModal"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <label>URL</label>
+      <input type="text" id="addUrl" placeholder="https://...">
+      <label>Save as <span class="muted">(optional)</span></label>
+      <input type="text" id="addName" placeholder="filename.ext">
+      <label>Output folder <span class="muted">(blank = Downloads)</span></label>
+      <div class="row-input"><input type="text" id="addOutDir" placeholder="C:\Users\..."></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" data-close="addModal">Cancel</button>
+      <button class="btn-primary" id="btnAddOk">Start download</button>
+    </div>
+  </div>
+</div>
+
+<!-- Batch download modal -->
+<div class="modal-backdrop" id="batchModal" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-header">
+      <h3>Batch download</h3>
+      <button class="ic-btn" data-close="batchModal"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <label>URLs <span class="muted">(one per line; <code>[N-M]</code>, <code>[001-100]</code>, <code>[a-z]</code> ranges expand)</span></label>
+      <textarea id="batchUrls" rows="10" placeholder="https://example.com/file1.zip&#10;https://example.com/files/[001-050].pdf&#10;https://example.com/chap[a-z].mp3"></textarea>
+      <label>Output folder <span class="muted">(blank = Downloads)</span></label>
+      <input type="text" id="batchOutDir" placeholder="C:\Users\...">
+      <div id="batchPreview" class="batch-preview muted">0 URLs queued</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" data-close="batchModal">Cancel</button>
+      <button class="btn-primary" id="btnBatchOk">Add all</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="modal-backdrop" id="settingsModal" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-header">
+      <h3>Settings</h3>
+      <button class="ic-btn" data-close="settingsModal"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-grid">
+        <label>Default output folder</label>
+        <input type="text" id="setOutDir" placeholder="(Downloads)">
+
+        <label>Connections per file</label>
+        <input type="number" id="setConns" min="1" max="32">
+
+        <label>Max simultaneous downloads</label>
+        <input type="number" id="setMaxJobs" min="1" max="20">
+
+        <label>Bandwidth limit <span class="muted">(KB/s, 0 = unlimited)</span></label>
+        <input type="number" id="setBwKbps" min="0">
+
+        <label class="checkbox">
+          <input type="checkbox" id="setClipWatch">
+          Watch clipboard for download URLs
+        </label>
+
+        <label class="checkbox">
+          <input type="checkbox" id="setVerifyChecksum">
+          Verify checksums when servers advertise them
+        </label>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" data-close="settingsModal">Cancel</button>
+      <button class="btn-primary" id="btnSettingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Properties modal -->
+<div class="modal-backdrop" id="propsModal" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-header">
+      <h3>File Properties</h3>
+      <button class="ic-btn" data-close="propsModal"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="props-grid">
+        <label>Type</label>            <div id="propType"></div>
+        <label>Status</label>          <div id="propStatus"></div>
+        <label>Size</label>            <div id="propSize"></div>
+        <label>Save to</label>         <div id="propSaveTo" class="props-mono"></div>
+        <label>Address</label>         <div id="propUrl" class="props-mono"></div>
+        <label>Web page</label>        <div id="propReferer" class="props-mono"></div>
+        <label>User agent</label>      <div id="propUA" class="props-mono"></div>
+        <label>Description</label>     <div id="propDesc"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="btnPropsOpen">Open file</button>
+      <button class="btn-secondary" id="btnPropsFolder">Open folder</button>
+      <button class="btn-primary" data-close="propsModal">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- Right-click context menu -->
+<div class="ctxmenu" id="ctxMenu" hidden>
+  <div class="ctx-item" data-act="openFile">Open</div>
+  <div class="ctx-item" data-act="openFolder">Open folder</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" data-act="resume">Resume</div>
+  <div class="ctx-item" data-act="pause">Pause</div>
+  <div class="ctx-item" data-act="redownload">Redownload</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" data-act="remove">Remove</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" data-act="properties">Properties</div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-stack" id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

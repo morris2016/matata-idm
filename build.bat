@@ -25,6 +25,10 @@ if /I "%1"=="debug" set MODE=debug
 set CFLAGS=/nologo /EHsc /std:c++17 /W4 /permissive- /DUNICODE /D_UNICODE /I"%INC%"
 set LFLAGS=/nologo winhttp.lib ws2_32.lib shlwapi.lib advapi32.lib user32.lib bcrypt.lib
 
+rem WebView2 SDK paths (fetched by fetch-webview2.ps1).
+set WV2_INC=%ROOT%third-party\webview2\include
+set WV2_LIB=%ROOT%third-party\webview2\lib\x64
+
 if "%MODE%"=="debug" (
     set CFLAGS=%CFLAGS% /Od /Zi /MDd /D_DEBUG
     set LFLAGS=%LFLAGS% /DEBUG
@@ -40,6 +44,13 @@ if not exist %VCVARS% (
 )
 
 if not exist "%BUILD%" mkdir "%BUILD%"
+
+rem ---- fetch WebView2 SDK on first run ----
+if not exist "%WV2_INC%\WebView2.h" (
+    echo [matata] WebView2 SDK not found, fetching...
+    powershell -ExecutionPolicy Bypass -File "%ROOT%fetch-webview2.ps1"
+    if errorlevel 1 ( echo [matata] WebView2 SDK fetch failed & exit /b 1 )
+)
 
 rem ---- build ----
 call %VCVARS% >nul
@@ -75,8 +86,8 @@ cl %CFLAGS% %LIB_SOURCES% "%SRC%\main.cpp" /Fe:matata.exe /link %LFLAGS%
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" goto :fail
 
-echo [matata] compiling matata-gui.exe %MODE% ...
-cl %CFLAGS% %LIB_SOURCES% "%SRC%\gui_main.cpp" /Fe:matata-gui.exe /link %LFLAGS% comctl32.lib gdi32.lib ole32.lib shell32.lib /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup
+echo [matata] compiling matata-gui.exe %MODE% (WebView2) ...
+cl %CFLAGS% /I"%WV2_INC%" %LIB_SOURCES% "%SRC%\gui2_main.cpp" /Fe:matata-gui.exe /link %LFLAGS% comctl32.lib gdi32.lib ole32.lib shell32.lib version.lib "%WV2_LIB%\WebView2LoaderStatic.lib" /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" goto :fail
 

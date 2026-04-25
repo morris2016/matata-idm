@@ -61,6 +61,15 @@ disabled until every one is populated.
 > shown in the popup is filtered to that tab. No other tab data is
 > read or stored.
 
+**`scripting`**
+
+> Run a small content script on YouTube and Vimeo pages that reads the
+> player's already-loaded format list (resolutions / codecs) so the user
+> can pick a quality from the popup. The script does not modify the
+> page, does not log keystrokes or DOM, and does not contact any remote
+> server. Format URLs are only sent to the locally-installed matata
+> application via Native Messaging when the user clicks "grab".
+
 **Host permissions: `<all_urls>`**
 
 > Required because the user can download from any origin. The

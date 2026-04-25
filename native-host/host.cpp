@@ -79,6 +79,33 @@ bool readMessage(std::string& out) {
 // response sender, and exit-notifier all share this channel.
 std::mutex g_writeMu;
 
+// File-based diagnostic log (%TEMP%\matata-host.log). Independent from the
+// Native Messaging stdout so we don't corrupt the protocol.
+std::mutex g_logMu;
+void hostLog(const std::string& s) {
+    std::lock_guard<std::mutex> lk(g_logMu);
+    char dir[MAX_PATH];
+    DWORD n = GetTempPathA(MAX_PATH, dir);
+    if (n == 0 || n >= MAX_PATH) return;
+    std::string path = std::string(dir) + "matata-host.log";
+    HANDLE h = CreateFileA(path.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    char pre[64];
+    _snprintf_s(pre, _TRUNCATE, "[%02d:%02d:%02d.%03d pid=%lu] ",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                GetCurrentProcessId());
+    std::string line = pre;
+    line += s;
+    line += "\r\n";
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    DWORD w = 0;
+    WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr);
+    CloseHandle(h);
+}
+
 bool writeMessage(const std::string& json) {
     std::lock_guard<std::mutex> lk(g_writeMu);
     uint32_t len = (uint32_t)json.size();
@@ -368,10 +395,13 @@ bool launchMatata(const std::map<std::string,std::string>& msg,
     std::string url = get("url");
     if (url.empty()) { errorOut = "missing url"; return false; }
 
-    std::wstring matataExe = exeDir() + L"\\matata.exe";
-    DWORD attrs = GetFileAttributesW(matataExe.c_str());
+    // Hand off to the GUI (matata-gui.exe). The GUI is single-instance and
+    // accepts --add-url via command line or WM_COPYDATA; it takes ownership
+    // of the download and shows it in its own window, IDM-style.
+    std::wstring guiExe = exeDir() + L"\\matata-gui.exe";
+    DWORD attrs = GetFileAttributesW(guiExe.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
-        errorOut = "matata.exe not found next to matata-host.exe";
+        errorOut = "matata-gui.exe not found next to matata-host.exe";
         return false;
     }
 
@@ -381,73 +411,113 @@ bool launchMatata(const std::map<std::string,std::string>& msg,
     std::string jobId = get("jobId");
     if (jobId.empty()) jobId = generateJobId();
 
-    std::wstring cmd = quoteArg(matataExe);
-    cmd += L" " + quoteArg(utf8ToWide(url));
-    cmd += L" --json-progress --job-id " + quoteArg(utf8ToWide(jobId));
+    std::wstring cmd = quoteArg(guiExe);
+    cmd += L" --add-url " + quoteArg(utf8ToWide(url));
 
-    auto addHeader = [&](const char* key, const char* prefix) {
-        std::string v = get(key);
+    auto addArg = [&](const wchar_t* flag, const std::string& v) {
         if (v.empty()) return;
-        std::wstring hv = utf8ToWide(std::string(prefix) + v);
-        cmd += L" -H ";
-        cmd += quoteArg(hv);
+        cmd += L" ";
+        cmd += flag;
+        cmd += L" ";
+        cmd += quoteArg(utf8ToWide(v));
     };
-    addHeader("referer",   "Referer: ");
-    addHeader("cookie",    "Cookie: ");
-    addHeader("userAgent", "User-Agent: ");
-
-    std::string fn = get("filename");
-    if (!fn.empty()) { cmd += L" -o "; cmd += quoteArg(utf8ToWide(fn)); }
-    if (!outDir.empty()) { cmd += L" -d "; cmd += quoteArg(outDir); }
-
-    // Create a pipe for the child's stdout+stderr.
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        errorOut = "CreatePipe failed";
-        return false;
+    addArg(L"--referer",    get("referer"));
+    {
+        // Windows CreateProcess command-line maxes out at 32KB. Some sites
+        // (notably YouTube when logged in) return cookies far larger than
+        // that. Drop the cookie if it would push us over a safe budget — the
+        // GUI-side worker can fetch its own auth where needed (yt-dlp etc).
+        std::string ck = get("cookie");
+        if (ck.size() > 8000) {
+            hostLog("dropping oversized cookie len=" + std::to_string(ck.size()));
+            ck.clear();
+        }
+        if (!ck.empty()) addArg(L"--cookie", ck);
     }
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+    addArg(L"--user-agent", get("userAgent"));
+    addArg(L"--filename",   get("filename"));
+    addArg(L"--yt-format",  get("ytFormat"));
+
+    // Page-fresh cookies (Netscape cookies.txt body) for yt-dlp. Native
+    // Messaging caps frames at 1MB so this fits comfortably; cmdline args
+    // would not. Write to a temp file and pass the path.
+    {
+        std::string ckFile = get("cookieFile");
+        if (!ckFile.empty()) {
+            wchar_t dir[MAX_PATH];
+            DWORD n = GetTempPathW(MAX_PATH, dir);
+            if (n > 0 && n < MAX_PATH) {
+                std::wstring path = dir;
+                path += L"matata-cookies-";
+                path += utf8ToWide(jobId);
+                path += L".txt";
+                HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    DWORD w = 0;
+                    WriteFile(h, ckFile.data(), (DWORD)ckFile.size(), &w, nullptr);
+                    CloseHandle(h);
+                    int n2 = WideCharToMultiByte(CP_UTF8, 0, path.data(), (int)path.size(),
+                                                 nullptr, 0, nullptr, nullptr);
+                    std::string pathUtf8(n2, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, path.data(), (int)path.size(),
+                                        pathUtf8.data(), n2, nullptr, nullptr);
+                    hostLog("wrote cookies file path=" + pathUtf8 +
+                            " bytes=" + std::to_string(ckFile.size()));
+                    addArg(L"--cookies-file", pathUtf8);
+                } else {
+                    hostLog("CreateFile cookies failed ec=" +
+                            std::to_string((unsigned)GetLastError()));
+                }
+            }
+        }
+    }
+
+    std::string outDirUtf8;
+    if (!outDir.empty()) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, outDir.data(), (int)outDir.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        outDirUtf8.resize(n);
+        WideCharToMultiByte(CP_UTF8, 0, outDir.data(), (int)outDir.size(),
+                            outDirUtf8.data(), n, nullptr, nullptr);
+    }
+    addArg(L"--out-dir", outDirUtf8);
 
     STARTUPINFOW si{}; si.cb = sizeof(si);
-    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput  = hWrite;
-    si.hStdError   = hWrite;
-    si.hStdInput   = INVALID_HANDLE_VALUE;
-
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(L'\0');
 
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, cmd.data(), (int)cmd.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        std::string cmdUtf8(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, cmd.data(), (int)cmd.size(),
+                            cmdUtf8.data(), n, nullptr, nullptr);
+        hostLog("CreateProcessW cmdline len=" + std::to_string(cmd.size()) +
+                " head=" + cmdUtf8.substr(0, 400));
+    }
     BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr,
-                             TRUE, CREATE_NO_WINDOW,
+                             FALSE, DETACHED_PROCESS,
                              nullptr, nullptr, &si, &pi);
-    CloseHandle(hWrite);
     if (!ok) {
-        CloseHandle(hRead);
-        errorOut = "CreateProcess failed";
+        DWORD ec = GetLastError();
+        hostLog("CreateProcessW FAILED ec=" + std::to_string((unsigned)ec));
+        errorOut = "CreateProcess failed: " + std::to_string((unsigned)ec);
         return false;
     }
+    hostLog("CreateProcessW OK pid=" + std::to_string((unsigned)pi.dwProcessId));
 
-    // Reader + waiter thread: forwards lines, then emits a final "exit"
-    // message once matata exits. g_activeJobs lets main() hold the process
-    // alive until every spawned child has flushed.
-    HANDLE hProc = pi.hProcess;
-    g_activeJobs.fetch_add(1);
-    std::thread([hRead, hProc, jobId]() {
-        forwardChildLines(hRead, jobId);
-        CloseHandle(hRead);
-        WaitForSingleObject(hProc, INFINITE);
-        DWORD rc = 1;
-        GetExitCodeProcess(hProc, &rc);
-        CloseHandle(hProc);
-        std::string out = std::string("{\"jobId\":\"") + jobId
-                        + "\",\"type\":\"exit\",\"code\":" + std::to_string((int)rc) + "}";
-        writeMessage(out);
-        g_activeJobs.fetch_sub(1);
-    }).detach();
+    // We don't wait for the GUI; it either starts fresh or forwards to an
+    // already-running instance and exits. Either way it owns the download.
+    CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    // Let the extension know which job id we allocated, even though no
+    // progress stream will follow (the GUI displays it, not us).
+    std::string emit = std::string("{\"jobId\":\"") + jobId
+                     + "\",\"type\":\"handoff\",\"target\":\"gui\"}";
+    writeMessage(emit);
 
     jobIdOut = jobId;
     return true;
@@ -461,23 +531,30 @@ int main() {
     _setmode(_fileno(stdin),  _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 
+    hostLog("matata-host started");
+
     for (;;) {
         std::string raw;
-        if (!readMessage(raw)) break;
+        if (!readMessage(raw)) { hostLog("readMessage returned false (stdin closed)"); break; }
 
         auto msg = parseFlat(raw);
         std::string action = msg.count("action") ? msg["action"] : std::string();
+        std::string url    = msg.count("url")    ? msg["url"]    : std::string();
+        hostLog("recv action=" + action + " url=" + url.substr(0, 200));
 
         if (action == "ping") {
             writeMessage(buildJson({ {"ok","true"}, {"version","0.4"} }));
         } else if (action == "download") {
             std::string err, jobId;
             if (launchMatata(msg, jobId, err)) {
+                hostLog("launchMatata OK jobId=" + jobId);
                 writeMessage(buildJson({ {"ok","true"}, {"jobId", jobId} }));
             } else {
+                hostLog("launchMatata FAIL err=" + err);
                 writeMessage(buildJson({ {"ok","false"}, {"error",err} }));
             }
         } else {
+            hostLog("unknown action=" + action);
             writeMessage(buildJson({ {"ok","false"},
                                      {"error", "unknown action: " + action} }));
         }
