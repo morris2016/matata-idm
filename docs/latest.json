@@ -1,0 +1,5 @@
+{
+  "version": "0.9.3",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.3/matata-0.9.3-setup.exe",
+  "notes": "- WebView2 GUI shell with HTML/CSS frontend\n- In-app update prompt on launch\n- Fixed YouTube playlist filenames (children show real titles, not 'watch')\n- Firefox AMO bundle support\n- HLS/DASH sniff overlay + YouTube/Vimeo extractor in the browser extension"
+}
