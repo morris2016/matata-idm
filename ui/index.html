@@ -149,6 +149,42 @@
           Verify checksums when servers advertise them
         </label>
       </div>
+
+      <h4 class="settings-section">Scheduler</h4>
+      <p class="muted settings-help">
+        Run downloads only inside a time window. Outside the window, the queue
+        is paused and any active downloads are stopped (resume on next window).
+      </p>
+      <div class="settings-grid">
+        <label class="checkbox">
+          <input type="checkbox" id="setSchedEnabled">
+          Enable scheduler
+        </label>
+        <span></span>
+
+        <label>Start time</label>
+        <input type="time" id="setSchedStart">
+
+        <label>Stop time</label>
+        <input type="time" id="setSchedStop">
+
+        <label>Days</label>
+        <div class="day-row" id="setSchedDays">
+          <label class="day-chk"><input type="checkbox" data-day="0"><span>Sun</span></label>
+          <label class="day-chk"><input type="checkbox" data-day="1"><span>Mon</span></label>
+          <label class="day-chk"><input type="checkbox" data-day="2"><span>Tue</span></label>
+          <label class="day-chk"><input type="checkbox" data-day="3"><span>Wed</span></label>
+          <label class="day-chk"><input type="checkbox" data-day="4"><span>Thu</span></label>
+          <label class="day-chk"><input type="checkbox" data-day="5"><span>Fri</span></label>
+          <label class="day-chk"><input type="checkbox" data-day="6"><span>Sat</span></label>
+        </div>
+
+        <label class="checkbox">
+          <input type="checkbox" id="setSchedShutdownDone">
+          Shut down PC when downloads complete
+        </label>
+        <span></span>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-secondary" data-close="settingsModal">Cancel</button>

@@ -552,6 +552,35 @@ function fillSettings() {
   $("setBwKbps").value            = Math.floor((s.bandwidthBps || 0) / 1024);
   $("setClipWatch").checked       = !!s.clipboardWatch;
   $("setVerifyChecksum").checked  = s.verifyChecksum !== false;
+  // Scheduler.
+  $("setSchedEnabled").checked       = !!s.schedEnabled;
+  $("setSchedStart").value           = minutesToHHMM(s.schedStartMinutes ?? 22*60);
+  $("setSchedStop").value            = minutesToHHMM(s.schedStopMinutes  ?? 7*60);
+  $("setSchedShutdownDone").checked  = !!s.schedShutdownDone;
+  const mask = (s.schedDaysMask ?? 0x7F);
+  document.querySelectorAll('#setSchedDays input[type=checkbox]').forEach(el => {
+    const bit = Number(el.dataset.day);
+    el.checked = ((mask >> bit) & 1) === 1;
+  });
+}
+
+// "HH:MM" <-> minutes-since-midnight helpers used by the scheduler UI.
+function minutesToHHMM(m) {
+  m = Math.max(0, Math.min(24*60 - 1, Number(m) || 0));
+  const h = Math.floor(m / 60), mm = m % 60;
+  return String(h).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+}
+function hhmmToMinutes(s) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || ""));
+  if (!m) return 0;
+  return Math.min(24*60 - 1, Math.max(0, parseInt(m[1],10)*60 + parseInt(m[2],10)));
+}
+function readScheduleDaysMask() {
+  let mask = 0;
+  document.querySelectorAll('#setSchedDays input[type=checkbox]').forEach(el => {
+    if (el.checked) mask |= (1 << Number(el.dataset.day));
+  });
+  return mask;
 }
 
 // ---- event wiring ---------------------------------------------------
@@ -684,7 +713,17 @@ document.addEventListener("DOMContentLoaded", () => {
       maxJobs:         parseInt($("setMaxJobs").value, 10) || 3,
       bandwidthBps:    (parseInt($("setBwKbps").value, 10) || 0) * 1024,
       clipboardWatch:  $("setClipWatch").checked,
-      verifyChecksum:  $("setVerifyChecksum").checked
+      verifyChecksum:  $("setVerifyChecksum").checked,
+      // Scheduler.
+      schedEnabled:       $("setSchedEnabled").checked,
+      schedStartMinutes:  hhmmToMinutes($("setSchedStart").value),
+      schedStopMinutes:   hhmmToMinutes($("setSchedStop").value),
+      schedDaysMask:      readScheduleDaysMask(),
+      schedShutdownDone:  $("setSchedShutdownDone").checked,
+      // Carry forward fields the modal doesn't edit so the host doesn't
+      // overwrite them with defaults.
+      categorize:    !!state.settings.categorize,
+      queuePaused:   !!state.settings.queuePaused
     };
     send({type:"setSettings", settings: s});
     state.settings = s;

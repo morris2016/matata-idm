@@ -238,6 +238,18 @@ struct Settings {
     // in Queued and dispatchQueued doesn't promote anything -- already-running
     // downloads keep going. Mirrors IDM's Downloads -> Stop queue.
     bool         queuePaused     = false;
+    // Scheduler. When schedEnabled, a worker tick toggles queuePaused on the
+    // Start/Stop edges and (optionally) aborts running items at Stop. Times
+    // are minutes-since-midnight. daysMask is bit 0=Sun..bit 6=Sat. If the
+    // start/stop window wraps midnight (start > stop) it spans two days.
+    // shutdownWhenDone: once a download lands successfully while enabled,
+    // we arm a one-shot; when the queue subsequently fully drains we run
+    // shutdown.exe with a 60s grace period.
+    bool         schedEnabled        = false;
+    int          schedStartMinutes   = 22 * 60;   // 22:00
+    int          schedStopMinutes    = 7  * 60;   // 07:00
+    int          schedDaysMask       = 0x7F;      // every day
+    bool         schedShutdownDone   = false;
     int          windowX = CW_USEDEFAULT, windowY = CW_USEDEFAULT;
     int          windowW = 1180, windowH = 760;
     bool         windowMaximized = false;
@@ -274,6 +286,11 @@ void loadSettings() {
     d = g_settings.verifyChecksum ? 1 : 0; rdDword(L"verifyChecksum",  d); g_settings.verifyChecksum  = (d != 0);
     d = g_settings.categorize     ? 1 : 0; rdDword(L"categorize",      d); g_settings.categorize      = (d != 0);
     d = g_settings.queuePaused    ? 1 : 0; rdDword(L"queuePaused",     d); g_settings.queuePaused     = (d != 0);
+    d = g_settings.schedEnabled   ? 1 : 0; rdDword(L"schedEnabled",    d); g_settings.schedEnabled    = (d != 0);
+    d = (DWORD)g_settings.schedStartMinutes; rdDword(L"schedStartMinutes", d); g_settings.schedStartMinutes = (int)d;
+    d = (DWORD)g_settings.schedStopMinutes;  rdDword(L"schedStopMinutes",  d); g_settings.schedStopMinutes  = (int)d;
+    d = (DWORD)g_settings.schedDaysMask;     rdDword(L"schedDaysMask",     d); g_settings.schedDaysMask     = (int)d;
+    d = g_settings.schedShutdownDone ? 1 : 0; rdDword(L"schedShutdownDone", d); g_settings.schedShutdownDone = (d != 0);
     d = (DWORD)g_settings.windowX; rdDword(L"windowX", d); g_settings.windowX = (int)d;
     d = (DWORD)g_settings.windowY; rdDword(L"windowY", d); g_settings.windowY = (int)d;
     d = (DWORD)g_settings.windowW; rdDword(L"windowW", d); g_settings.windowW = (int)d;
@@ -305,6 +322,11 @@ void saveSettings() {
     wrDword(L"verifyChecksum",  g_settings.verifyChecksum ? 1 : 0);
     wrDword(L"categorize",      g_settings.categorize     ? 1 : 0);
     wrDword(L"queuePaused",     g_settings.queuePaused    ? 1 : 0);
+    wrDword(L"schedEnabled",    g_settings.schedEnabled   ? 1 : 0);
+    wrDword(L"schedStartMinutes", (DWORD)g_settings.schedStartMinutes);
+    wrDword(L"schedStopMinutes",  (DWORD)g_settings.schedStopMinutes);
+    wrDword(L"schedDaysMask",     (DWORD)g_settings.schedDaysMask);
+    wrDword(L"schedShutdownDone", g_settings.schedShutdownDone ? 1 : 0);
     wrDword(L"windowX", (DWORD)g_settings.windowX);
     wrDword(L"windowY", (DWORD)g_settings.windowY);
     wrDword(L"windowW", (DWORD)g_settings.windowW);
@@ -464,7 +486,12 @@ std::wstring serializeSettings() {
     out += L"\"clipboardWatch\":"; out += g_settings.clipboardWatch ? L"true" : L"false"; out += L",";
     out += L"\"verifyChecksum\":"; out += g_settings.verifyChecksum ? L"true" : L"false"; out += L",";
     out += L"\"categorize\":";     out += g_settings.categorize     ? L"true" : L"false"; out += L",";
-    out += L"\"queuePaused\":";    out += g_settings.queuePaused    ? L"true" : L"false";
+    out += L"\"queuePaused\":";    out += g_settings.queuePaused    ? L"true" : L"false"; out += L",";
+    out += L"\"schedEnabled\":";   out += g_settings.schedEnabled   ? L"true" : L"false"; out += L",";
+    _snwprintf_s(buf, _TRUNCATE, L"\"schedStartMinutes\":%d,", g_settings.schedStartMinutes); out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"schedStopMinutes\":%d,",  g_settings.schedStopMinutes);  out += buf;
+    _snwprintf_s(buf, _TRUNCATE, L"\"schedDaysMask\":%d,",     g_settings.schedDaysMask);     out += buf;
+    out += L"\"schedShutdownDone\":"; out += g_settings.schedShutdownDone ? L"true" : L"false";
     out += L"}";
     return out;
 }
@@ -579,6 +606,163 @@ void onUpdateAvailable(UpdateAvailMsg* m) {
     if (r == IDYES && !m->downloadUrl.empty()) {
         ShellExecuteW(g_hwnd, L"open", m->downloadUrl.c_str(),
                       nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+// ---- scheduler ------------------------------------------------------
+
+// Globals owned by the scheduler tick. Both flags are written by the worker
+// thread and the message handler that toggles schedEnabled, so they're
+// std::atomic to avoid undefined behaviour when both touch them.
+std::atomic<bool> g_schedExitFlag{false};
+std::atomic<bool> g_schedShutdownArmed{false};
+
+// Forward decls: these helpers live in item-ops further down.
+void dispatchQueued();
+void abortItem(int id);
+
+// Returns minutes-since-midnight for the local clock now, plus the day of
+// week in 0..6 with 0 = Sunday (matches schedDaysMask bit ordering).
+void schedNow(int& minutes, int& dayOfWeek) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    minutes   = st.wHour * 60 + st.wMinute;
+    dayOfWeek = st.wDayOfWeek;     // already 0..6, Sun..Sat
+}
+
+// In-window check that handles wrap-around (e.g. 22:00 -> 07:00 spans
+// midnight). For non-wrap windows, the half-open interval [start, stop)
+// is in-window. For wrap windows, in-window is "now >= start OR now < stop".
+// Equal start and stop is treated as never (zero-width window).
+bool schedInWindow(int nowMin, int startMin, int stopMin) {
+    if (startMin == stopMin) return false;
+    if (startMin < stopMin)  return nowMin >= startMin && nowMin < stopMin;
+    return nowMin >= startMin || nowMin < stopMin;
+}
+
+// Trigger Windows shutdown with a 60-second grace window so the user can
+// abort with `shutdown /a`. We never run this if the user disabled the
+// shutdown-when-done option mid-flight.
+void schedTriggerShutdown() {
+    dbgLog(L"scheduler: triggering OS shutdown (60s grace)");
+    STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    wchar_t cmd[] = L"shutdown.exe /s /t 60 /c \"matata: scheduled downloads complete\"";
+    if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        dbgLog(L"scheduler: shutdown.exe launch failed err=%lu", GetLastError());
+    }
+}
+
+// One scheduler tick. Detects the IN/OUT edges and applies them.
+//   start edge: clear queuePaused, kick the queue
+//   stop  edge: set   queuePaused, abort everything currently running
+// Also handles the shutdown-when-done one-shot.
+void schedTick(bool& wasIn) {
+    if (!g_settings.schedEnabled) {
+        wasIn = false;
+        return;
+    }
+    int nowMin, dow;
+    schedNow(nowMin, dow);
+    bool dayOk = (g_settings.schedDaysMask >> dow) & 1;
+    bool inNow = dayOk && schedInWindow(nowMin,
+                                        g_settings.schedStartMinutes,
+                                        g_settings.schedStopMinutes);
+    if (inNow != wasIn) {
+        if (inNow) {
+            dbgLog(L"scheduler: START edge (now=%02d:%02d window=%d-%d dow=%d)",
+                   nowMin/60, nowMin%60,
+                   g_settings.schedStartMinutes, g_settings.schedStopMinutes, dow);
+            // Un-pause the queue if it was paused. Don't clobber a manual
+            // pause the user set after the last start: only flip if we
+            // were the ones that set it on the previous Stop edge.
+            if (g_settings.queuePaused) {
+                g_settings.queuePaused = false;
+                saveSettings();
+                emitSettings();
+            }
+            dispatchQueued();
+            emitToast(L"Scheduler: starting downloads", L"info");
+            // Only arm shutdown-when-done if we actually started something --
+            // an empty queue at the Start edge means the user has nothing
+            // scheduled and we shouldn't shut their PC down for nothing.
+            bool anyPending = false;
+            {
+                std::lock_guard<std::mutex> lk(g_itemsMu);
+                for (auto& it : g_items) {
+                    if (it->state == ItemState::Running ||
+                        it->state == ItemState::Queued) {
+                        anyPending = true; break;
+                    }
+                }
+            }
+            g_schedShutdownArmed.store(g_settings.schedShutdownDone && anyPending);
+        } else {
+            dbgLog(L"scheduler: STOP edge (now=%02d:%02d window=%d-%d dow=%d)",
+                   nowMin/60, nowMin%60,
+                   g_settings.schedStartMinutes, g_settings.schedStopMinutes, dow);
+            if (!g_settings.queuePaused) {
+                g_settings.queuePaused = true;
+                saveSettings();
+                emitSettings();
+            }
+            std::vector<int> ids;
+            {
+                std::lock_guard<std::mutex> lk(g_itemsMu);
+                for (auto& it : g_items)
+                    if (it->state == ItemState::Running) ids.push_back(it->id);
+            }
+            for (int id : ids) abortItem(id);
+            emitToast(L"Scheduler: pausing downloads", L"info");
+        }
+        wasIn = inNow;
+    }
+
+    // Shutdown-when-done one-shot: only fires if armed (a download
+    // completed during a scheduled window), the queue has fully drained,
+    // and the user still has shutdownDone enabled.
+    if (g_schedShutdownArmed.load() && g_settings.schedShutdownDone) {
+        bool anyActive = false;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMu);
+            for (auto& it : g_items) {
+                if (it->state == ItemState::Running ||
+                    it->state == ItemState::Queued) {
+                    anyActive = true; break;
+                }
+            }
+        }
+        if (!anyActive) {
+            g_schedShutdownArmed.store(false);
+            schedTriggerShutdown();
+        }
+    }
+}
+
+void schedulerWorker() {
+    bool wasIn = false;
+    // First tick: align state with the current window so we don't fire a
+    // spurious "Starting downloads" toast on a fresh launch that's already
+    // inside the active window.
+    {
+        int nowMin, dow;
+        schedNow(nowMin, dow);
+        bool dayOk = g_settings.schedEnabled &&
+                     ((g_settings.schedDaysMask >> dow) & 1);
+        wasIn = dayOk && schedInWindow(nowMin,
+                                       g_settings.schedStartMinutes,
+                                       g_settings.schedStopMinutes);
+    }
+    while (!g_schedExitFlag.load()) {
+        schedTick(wasIn);
+        // Sleep in 1s slices so app shutdown isn't held up by the tick rate.
+        for (int i = 0; i < 30 && !g_schedExitFlag.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -1784,6 +1968,11 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
                     else if (sk == L"verifyChecksum") { bool b=true;  readBool(v, i, b); m.settings.verifyChecksum = b; }
                     else if (sk == L"categorize")     { bool b=false; readBool(v, i, b); m.settings.categorize = b; }
                     else if (sk == L"queuePaused")    { bool b=false; readBool(v, i, b); m.settings.queuePaused = b; }
+                    else if (sk == L"schedEnabled")   { bool b=false; readBool(v, i, b); m.settings.schedEnabled = b; }
+                    else if (sk == L"schedStartMinutes") { double d=0; readNumber(v, i, d); m.settings.schedStartMinutes = (int)d; }
+                    else if (sk == L"schedStopMinutes")  { double d=0; readNumber(v, i, d); m.settings.schedStopMinutes  = (int)d; }
+                    else if (sk == L"schedDaysMask")     { double d=0; readNumber(v, i, d); m.settings.schedDaysMask     = (int)d; }
+                    else if (sk == L"schedShutdownDone") { bool b=false; readBool(v, i, b); m.settings.schedShutdownDone = b; }
                     else                              { skipValue(v, i); }
                     skipWs(v, i);
                     if (i < v.n && v.s[i] == L',') { ++i; continue; }
@@ -1859,6 +2048,11 @@ void handleMessage(const std::wstring& json) {
             g_settings.clipboardWatch  = m.settings.clipboardWatch;
             g_settings.verifyChecksum  = m.settings.verifyChecksum;
             g_settings.categorize      = m.settings.categorize;
+            g_settings.schedEnabled       = m.settings.schedEnabled;
+            g_settings.schedStartMinutes  = m.settings.schedStartMinutes;
+            g_settings.schedStopMinutes   = m.settings.schedStopMinutes;
+            g_settings.schedDaysMask      = m.settings.schedDaysMask & 0x7F;
+            g_settings.schedShutdownDone  = m.settings.schedShutdownDone;
             saveSettings();
             emitSettings();
             emitToast(L"Settings saved", L"ok");
@@ -2102,6 +2296,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY: {
         saveSettings();
+        // Stop the scheduler tick before the rest of teardown.
+        g_schedExitFlag.store(true);
         // Tell every worker to stop; detach so we don't block teardown.
         std::lock_guard<std::mutex> lk(g_itemsMu);
         for (auto& it : g_items) {
@@ -2184,6 +2380,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     // through teardown -- worst case the HTTP fetch is a few KB and
     // returns within seconds.
     std::thread(updateCheckWorker).detach();
+
+    // Long-lived scheduler tick. Handles Start/Stop edges of the configured
+    // window, optional shutdown-when-done. Stops via g_schedExitFlag from
+    // WM_DESTROY; detached so a hung shutdown.exe call can't block teardown.
+    std::thread(schedulerWorker).detach();
 
     if (haveCli) {
         // Add now; if WebView is still initializing, the item event will be

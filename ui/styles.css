@@ -713,3 +713,33 @@ input, textarea {
 }
 .submenu-host:hover > .dropdown-submenu,
 .submenu-host.open > .dropdown-submenu { display: block; }
+
+/* ---- settings: scheduler section ---------------------------------- */
+
+.settings-section {
+  margin: 18px 0 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.settings-help { margin: 0 0 10px; font-size: 12px; }
+.day-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.day-chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-2);
+  border-radius: 14px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.day-chk input { margin: 0; }
+.day-chk:has(input:checked) {
+  background: var(--bg-row-h);
+  border-color: var(--accent, #4f8ef7);
+}
