@@ -86,8 +86,13 @@ cl %CFLAGS% %LIB_SOURCES% "%SRC%\main.cpp" /Fe:matata.exe /link %LFLAGS%
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" goto :fail
 
+echo [matata] compiling matata-app.res (icon resource) ...
+rc /nologo /fo"%BUILD%\matata-app.res" "%ROOT%installer\matata-app.rc"
+set RC=%ERRORLEVEL%
+if not "%RC%"=="0" goto :fail
+
 echo [matata] compiling matata-gui.exe %MODE% (WebView2) ...
-cl %CFLAGS% /I"%WV2_INC%" %LIB_SOURCES% "%SRC%\gui2_main.cpp" /Fe:matata-gui.exe /link %LFLAGS% comctl32.lib gdi32.lib ole32.lib shell32.lib version.lib "%WV2_LIB%\WebView2LoaderStatic.lib" /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup
+cl %CFLAGS% /I"%WV2_INC%" %LIB_SOURCES% "%SRC%\gui2_main.cpp" "%BUILD%\matata-app.res" /Fe:matata-gui.exe /link %LFLAGS% comctl32.lib gdi32.lib ole32.lib shell32.lib version.lib "%WV2_LIB%\WebView2LoaderStatic.lib" /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" goto :fail
 

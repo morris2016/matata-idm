@@ -1,0 +1,9 @@
+// Win32 resource for matata-gui.exe -- embeds the multi-resolution
+// matata.ico so Explorer / taskbar / Alt+Tab / Shell_NotifyIcon all
+// pick up the same crisp asset.
+//
+// Compiled by build.bat via rc.exe, linked into matata-gui.exe.
+
+#define IDI_MATATA_APPICON 101
+
+IDI_MATATA_APPICON ICON DISCARDABLE "matata.ico"

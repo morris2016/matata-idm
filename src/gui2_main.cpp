@@ -64,6 +64,11 @@ constexpr UINT WM_APP_COMPLETED     = WM_APP + 12; // worker done
 constexpr UINT WM_APP_UPDATE_AVAIL  = WM_APP + 13; // background update check found newer version
 constexpr UINT WM_APP_TRAYICON      = WM_APP + 14; // Shell_NotifyIcon callback
 
+// Resource ID of the embedded matata icon (see installer/matata-app.rc).
+// Loaded via LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_MATATA_APPICON)) for
+// the window class and the tray.
+constexpr int IDI_MATATA_APPICON = 101;
+
 // Update manifest published at the project's GitHub Pages site. Schema:
 //   { "version": "0.9.4", "url": "https://.../matata-0.9.4-setup.exe",
 //     "notes":   "What's new in 0.9.4..." }
@@ -1098,8 +1103,11 @@ void installTrayIcon() {
     g_trayIcon.uID    = kTrayIconId;
     g_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_trayIcon.uCallbackMessage = WM_APP_TRAYICON;
-    g_trayIcon.hIcon  = (HICON)LoadImageW(nullptr, IDI_APPLICATION,
-                                          IMAGE_ICON, 16, 16, LR_SHARED);
+    g_trayIcon.hIcon  = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_MATATA_APPICON),
+                                          IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    if (!g_trayIcon.hIcon)
+        g_trayIcon.hIcon = (HICON)LoadImageW(nullptr, IDI_APPLICATION,
+                                             IMAGE_ICON, 16, 16, LR_SHARED);
     wcscpy_s(g_trayIcon.szTip, _countof(g_trayIcon.szTip), L"matata");
     if (Shell_NotifyIconW(NIM_ADD, &g_trayIcon)) g_trayInstalled = true;
 }
@@ -2908,8 +2916,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = kClassName;
-    wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
-    wc.hIconSm       = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_MATATA_APPICON));
+    wc.hIconSm       = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_MATATA_APPICON),
+                                         IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    if (!wc.hIcon)   wc.hIcon   = LoadIconW(nullptr, IDI_APPLICATION);
+    if (!wc.hIconSm) wc.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
     // Borderless top-level window: drop the OS title bar so only our custom

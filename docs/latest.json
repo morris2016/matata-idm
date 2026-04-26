@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.1",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.1/matata-0.9.9.1-setup.exe",
-  "notes": "- Close button (X) and Alt+F4 now hide to tray instead of exiting\n- Tray menu's Exit is the only path that actually quits matata"
+  "version": "0.9.9.2",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.2/matata-0.9.9.2-setup.exe",
+  "notes": "- Production application icon: rounded-square gradient with download arrow + tray\n- Embedded in matata-gui.exe (16/24/32/48/64/128/256 sizes)\n- Used by Explorer, taskbar, Alt+Tab, system tray, installer setup wizard, and shortcuts"
 }

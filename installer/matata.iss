@@ -13,7 +13,7 @@
 ;   - optionally adds a Start-Menu shortcut to matata-gui.exe
 
 #define MyAppName      "matata"
-#define MyAppVersion   "0.9.9.1"
+#define MyAppVersion   "0.9.9.2"
 #define MyAppPublisher "matata"
 #define MyAppURL       "https://matata.example/"
 #define MyAppExeName   "matata-gui.exe"
@@ -35,6 +35,7 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=matata.ico
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
