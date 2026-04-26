@@ -29,6 +29,64 @@ ProxyConfig snapshotProxy() {
     return g_proxyCfg;
 }
 
+// Sites Logins. Plaintext list held in memory; the GUI layer is
+// responsible for DPAPI-encrypting before persisting.
+std::mutex                  g_siteLoginsMu;
+std::vector<SiteLogin>      g_siteLogins;
+
+std::wstring lowerWide(std::wstring s) {
+    for (auto& c : s) if (c < 128) c = (wchar_t)std::tolower((int)c);
+    return s;
+}
+
+// Tiny standards-conformant base64 encoder. Used only to encode the
+// Authorization: Basic <base64(user:pass)> credentials. Input is the
+// raw byte stream; output is ASCII.
+std::wstring base64Encode(const std::string& in) {
+    static const char* kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::wstring out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 3 <= in.size()) {
+        unsigned a = (unsigned char)in[i+0];
+        unsigned b = (unsigned char)in[i+1];
+        unsigned c = (unsigned char)in[i+2];
+        out.push_back(kAlphabet[(a >> 2) & 0x3F]);
+        out.push_back(kAlphabet[((a << 4) | (b >> 4)) & 0x3F]);
+        out.push_back(kAlphabet[((b << 2) | (c >> 6)) & 0x3F]);
+        out.push_back(kAlphabet[c & 0x3F]);
+        i += 3;
+    }
+    size_t rem = in.size() - i;
+    if (rem == 1) {
+        unsigned a = (unsigned char)in[i+0];
+        out.push_back(kAlphabet[(a >> 2) & 0x3F]);
+        out.push_back(kAlphabet[(a << 4) & 0x3F]);
+        out.push_back(L'=');
+        out.push_back(L'=');
+    } else if (rem == 2) {
+        unsigned a = (unsigned char)in[i+0];
+        unsigned b = (unsigned char)in[i+1];
+        out.push_back(kAlphabet[(a >> 2) & 0x3F]);
+        out.push_back(kAlphabet[((a << 4) | (b >> 4)) & 0x3F]);
+        out.push_back(kAlphabet[(b << 2) & 0x3F]);
+        out.push_back(L'=');
+    }
+    return out;
+}
+
+// UTF-16 -> UTF-8 (used for the user:pass payload before base64).
+std::string wideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                                nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                        out.data(), n, nullptr, nullptr);
+    return out;
+}
+
 std::wstring lastErrWinHttp(const wchar_t* op) {
     DWORD e = GetLastError();
     std::wostringstream ss;
@@ -132,9 +190,25 @@ std::wstring flattenHeaders(const ExtraHeaders& hdrs) {
     return ss.str();
 }
 
-// Build final header block: custom headers + optional Range.
-std::wstring buildHeaders(const ExtraHeaders& extras, const std::wstring& rangeHdr) {
-    return flattenHeaders(extras) + rangeHdr;
+// Build final header block: site-login auth (Basic) + custom headers +
+// optional Range. The auth header is suppressed if the caller already
+// supplied an Authorization in extras (caller wins).
+std::wstring buildHeaders(const ExtraHeaders& extras, const std::wstring& rangeHdr,
+                          const std::wstring& host) {
+    std::wstring out;
+    bool callerHasAuth = false;
+    for (auto& kv : extras) {
+        if (lowerAscii(kv.first) == L"authorization" && !kv.second.empty()) {
+            callerHasAuth = true; break;
+        }
+    }
+    if (!callerHasAuth) {
+        std::wstring h = siteAuthHeaderFor(host);
+        if (!h.empty()) { out += h; out += L"\r\n"; }
+    }
+    out += flattenHeaders(extras);
+    out += rangeHdr;
+    return out;
 }
 
 // Best-effort: enable HTTP/2 on the session. Ignored on Windows < 10 1709.
@@ -210,6 +284,45 @@ void setProxyConfig(const ProxyConfig& cfg) {
 
 ProxyConfig currentProxyConfig() { return snapshotProxy(); }
 
+void setSiteLogins(std::vector<SiteLogin> logins) {
+    for (auto& s : logins) s.host = lowerWide(s.host);
+    std::lock_guard<std::mutex> lk(g_siteLoginsMu);
+    g_siteLogins = std::move(logins);
+}
+
+std::vector<SiteLogin> currentSiteLogins() {
+    std::lock_guard<std::mutex> lk(g_siteLoginsMu);
+    return g_siteLogins;
+}
+
+std::wstring siteAuthHeaderFor(const std::wstring& host) {
+    std::wstring lcHost = lowerWide(host);
+    SiteLogin match;
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lk(g_siteLoginsMu);
+        for (auto& s : g_siteLogins) {
+            if (s.host.empty()) continue;
+            if (s.host == lcHost) { match = s; have = true; break; }
+            // Suffix match for subdomains: ".example.com" matches a host
+            // that ends in ".example.com" or equals "example.com".
+            if (s.host.size() > 1 && s.host.front() == L'.') {
+                std::wstring suffix = s.host.substr(1);
+                if (lcHost == suffix ||
+                    (lcHost.size() > suffix.size() &&
+                     lcHost.compare(lcHost.size() - suffix.size() - 1,
+                                    suffix.size() + 1,
+                                    L"." + suffix) == 0)) {
+                    match = s; have = true; break;
+                }
+            }
+        }
+    }
+    if (!have) return L"";
+    std::string raw = wideToUtf8(match.user) + ":" + wideToUtf8(match.pass);
+    return L"Authorization: Basic " + base64Encode(raw);
+}
+
 namespace {
 
 // Apply per-request proxy settings: when manual mode and creds are set,
@@ -247,7 +360,7 @@ bool probeResource(const Url& url, const ExtraHeaders& headers,
         WinHttpCloseHandle(conn); HttpSession::release(); return false;
     }
 
-    std::wstring hdrBlock = buildHeaders(headers, L"Range: bytes=0-0\r\n");
+    std::wstring hdrBlock = buildHeaders(headers, L"Range: bytes=0-0\r\n", url.host);
     applyProxyAuth(req);
 
     BOOL ok = WinHttpSendRequest(req, hdrBlock.c_str(), (DWORD)-1L,
@@ -355,7 +468,7 @@ int httpGetRange(const Url& url, const RangeRequest& range,
         ss << L"\r\n";
         rangeHdr = ss.str();
     }
-    std::wstring hdrBlock = buildHeaders(headers, rangeHdr);
+    std::wstring hdrBlock = buildHeaders(headers, rangeHdr, url.host);
     applyProxyAuth(req);
 
     BOOL ok = WinHttpSendRequest(req,

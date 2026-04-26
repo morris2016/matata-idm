@@ -13,6 +13,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <wincrypt.h>
 
 #include <wrl/client.h>
 #include <wrl/event.h>
@@ -61,6 +62,7 @@ constexpr UINT WM_APP_BRIDGE_EVENT  = WM_APP + 10; // post JSON to UI
 constexpr UINT WM_APP_PROGRESS      = WM_APP + 11; // worker progress
 constexpr UINT WM_APP_COMPLETED     = WM_APP + 12; // worker done
 constexpr UINT WM_APP_UPDATE_AVAIL  = WM_APP + 13; // background update check found newer version
+constexpr UINT WM_APP_TRAYICON      = WM_APP + 14; // Shell_NotifyIcon callback
 
 // Update manifest published at the project's GitHub Pages site. Schema:
 //   { "version": "0.9.4", "url": "https://.../matata-0.9.4-setup.exe",
@@ -268,12 +270,107 @@ struct Settings {
     std::wstring proxyBypass;            // ";"-separated list, or "<local>"
     std::wstring proxyUser;
     std::wstring proxyPass;              // plaintext for now; v0.9.9 to DPAPI
+    // v0.9.9 Sites Logins. Plaintext list lives in memory and is pushed
+    // into the HTTP layer (http.cpp::setSiteLogins). On disk the list is
+    // a single REG_BINARY blob with each password DPAPI-encrypted.
+    std::vector<SiteLogin> siteLogins;
     int          windowX = CW_USEDEFAULT, windowY = CW_USEDEFAULT;
     int          windowW = 1180, windowH = 760;
     bool         windowMaximized = false;
 };
 
 Settings g_settings;
+
+// ---- Sites Logins persistence (DPAPI + REG_BINARY blob) -------------
+
+std::vector<unsigned char> dpapiProtect(const std::wstring& plaintext) {
+    DATA_BLOB in{}, out{};
+    in.pbData = (BYTE*)plaintext.data();
+    in.cbData = (DWORD)(plaintext.size() * sizeof(wchar_t));
+    if (!CryptProtectData(&in, L"matata-site-login", nullptr, nullptr,
+                          nullptr, 0, &out)) return {};
+    std::vector<unsigned char> v(out.pbData, out.pbData + out.cbData);
+    LocalFree(out.pbData);
+    return v;
+}
+
+std::wstring dpapiUnprotect(const unsigned char* data, size_t len) {
+    DATA_BLOB in{}, out{};
+    in.pbData = (BYTE*)data;
+    in.cbData = (DWORD)len;
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
+                            0, &out)) return L"";
+    std::wstring s((const wchar_t*)out.pbData, out.cbData / sizeof(wchar_t));
+    LocalFree(out.pbData);
+    return s;
+}
+
+template <typename T>
+void blobAppendU32(std::vector<T>& blob, uint32_t v) {
+    static_assert(sizeof(T) == 1, "byte vector required");
+    blob.push_back((T)( v        & 0xFF));
+    blob.push_back((T)((v >>  8) & 0xFF));
+    blob.push_back((T)((v >> 16) & 0xFF));
+    blob.push_back((T)((v >> 24) & 0xFF));
+}
+
+bool blobReadU32(const unsigned char* p, size_t n, size_t& off, uint32_t& v) {
+    if (off + 4 > n) return false;
+    v = (uint32_t)p[off]
+      | ((uint32_t)p[off+1] <<  8)
+      | ((uint32_t)p[off+2] << 16)
+      | ((uint32_t)p[off+3] << 24);
+    off += 4;
+    return true;
+}
+
+std::vector<unsigned char> serializeSiteLogins(const std::vector<SiteLogin>& list) {
+    std::vector<unsigned char> blob;
+    blobAppendU32(blob, (uint32_t)list.size());
+    for (auto& s : list) {
+        auto pushWide = [&](const std::wstring& w) {
+            uint32_t cb = (uint32_t)(w.size() * sizeof(wchar_t));
+            blobAppendU32(blob, cb);
+            blob.insert(blob.end(),
+                        (const unsigned char*)w.data(),
+                        (const unsigned char*)w.data() + cb);
+        };
+        pushWide(s.host);
+        pushWide(s.user);
+        auto enc = dpapiProtect(s.pass);
+        blobAppendU32(blob, (uint32_t)enc.size());
+        blob.insert(blob.end(), enc.begin(), enc.end());
+    }
+    return blob;
+}
+
+std::vector<SiteLogin> deserializeSiteLogins(const unsigned char* data, size_t len) {
+    std::vector<SiteLogin> out;
+    size_t off = 0;
+    uint32_t count = 0;
+    if (!blobReadU32(data, len, off, count)) return out;
+    if (count > 4096) return out;
+    out.reserve(count);
+    auto readWide = [&](std::wstring& w) -> bool {
+        uint32_t cb = 0;
+        if (!blobReadU32(data, len, off, cb)) return false;
+        if (cb > len - off || (cb % sizeof(wchar_t)) != 0) return false;
+        w.assign((const wchar_t*)(data + off), cb / sizeof(wchar_t));
+        off += cb;
+        return true;
+    };
+    for (uint32_t i = 0; i < count; ++i) {
+        SiteLogin s;
+        if (!readWide(s.host) || !readWide(s.user)) return out;
+        uint32_t encLen = 0;
+        if (!blobReadU32(data, len, off, encLen)) return out;
+        if (encLen > len - off) return out;
+        s.pass = dpapiUnprotect(data + off, encLen);
+        off += encLen;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
 
 void loadSettings() {
     HKEY hk;
@@ -321,6 +418,18 @@ void loadSettings() {
     rdString(L"proxyBypass", g_settings.proxyBypass);
     rdString(L"proxyUser",   g_settings.proxyUser);
     rdString(L"proxyPass",   g_settings.proxyPass);
+    {
+        DWORD type = 0, cb = 0;
+        if (RegQueryValueExW(hk, L"siteLogins", nullptr, &type,
+                             nullptr, &cb) == ERROR_SUCCESS &&
+            type == REG_BINARY && cb > 0 && cb < 1024 * 1024) {
+            std::vector<unsigned char> blob(cb);
+            if (RegQueryValueExW(hk, L"siteLogins", nullptr, nullptr,
+                                 blob.data(), &cb) == ERROR_SUCCESS) {
+                g_settings.siteLogins = deserializeSiteLogins(blob.data(), blob.size());
+            }
+        }
+    }
     d = (DWORD)g_settings.windowX; rdDword(L"windowX", d); g_settings.windowX = (int)d;
     d = (DWORD)g_settings.windowY; rdDword(L"windowY", d); g_settings.windowY = (int)d;
     d = (DWORD)g_settings.windowW; rdDword(L"windowW", d); g_settings.windowW = (int)d;
@@ -369,6 +478,12 @@ void saveSettings() {
     wrString(L"proxyBypass", g_settings.proxyBypass);
     wrString(L"proxyUser",   g_settings.proxyUser);
     wrString(L"proxyPass",   g_settings.proxyPass);
+    {
+        auto blob = serializeSiteLogins(g_settings.siteLogins);
+        if (blob.empty()) RegDeleteValueW(hk, L"siteLogins");
+        else RegSetValueExW(hk, L"siteLogins", 0, REG_BINARY,
+                            blob.data(), (DWORD)blob.size());
+    }
     wrDword(L"windowX", (DWORD)g_settings.windowX);
     wrDword(L"windowY", (DWORD)g_settings.windowY);
     wrDword(L"windowW", (DWORD)g_settings.windowW);
@@ -545,7 +660,18 @@ std::wstring serializeSettings() {
     out += L"\"proxyServer\":";       out += quoteJson(g_settings.proxyServer);     out += L",";
     out += L"\"proxyBypass\":";       out += quoteJson(g_settings.proxyBypass);     out += L",";
     out += L"\"proxyUser\":";         out += quoteJson(g_settings.proxyUser);       out += L",";
-    out += L"\"proxyPass\":";         out += quoteJson(g_settings.proxyPass);
+    out += L"\"proxyPass\":";         out += quoteJson(g_settings.proxyPass);    out += L",";
+    out += L"\"siteLogins\":[";
+    for (size_t i = 0; i < g_settings.siteLogins.size(); ++i) {
+        if (i) out += L",";
+        out += L"{\"host\":";  out += quoteJson(g_settings.siteLogins[i].host);
+        out += L",\"user\":";  out += quoteJson(g_settings.siteLogins[i].user);
+        // Surface passwords to the UI so the user can edit a row inline.
+        // The bridge is local IPC; same trust boundary as the Settings modal.
+        out += L",\"pass\":";  out += quoteJson(g_settings.siteLogins[i].pass);
+        out += L"}";
+    }
+    out += L"]";
     out += L"}";
     return out;
 }
@@ -674,6 +800,7 @@ std::atomic<bool> g_schedShutdownArmed{false};
 // Forward decls: these helpers live in item-ops further down.
 void dispatchQueued();
 void abortItem(int id);
+void restartItem(int id);
 int  addDownloadEx(const HandoffSpec& spec);
 
 // Returns minutes-since-midnight for the local clock now, plus the day of
@@ -955,6 +1082,79 @@ void applyClipboardWatch(bool enable) {
         if (g_hwnd) RemoveClipboardFormatListener(g_hwnd);
         g_clipboardSubscribed = false;
         g_lastClipboardUrl.clear();
+    }
+}
+
+// ---- v0.9.9 system tray --------------------------------------------
+
+constexpr UINT kTrayIconId = 1;
+NOTIFYICONDATAW g_trayIcon{};
+bool            g_trayInstalled = false;
+
+void installTrayIcon() {
+    if (g_trayInstalled || !g_hwnd) return;
+    g_trayIcon.cbSize = sizeof(g_trayIcon);
+    g_trayIcon.hWnd   = g_hwnd;
+    g_trayIcon.uID    = kTrayIconId;
+    g_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_trayIcon.uCallbackMessage = WM_APP_TRAYICON;
+    g_trayIcon.hIcon  = (HICON)LoadImageW(nullptr, IDI_APPLICATION,
+                                          IMAGE_ICON, 16, 16, LR_SHARED);
+    wcscpy_s(g_trayIcon.szTip, _countof(g_trayIcon.szTip), L"matata");
+    if (Shell_NotifyIconW(NIM_ADD, &g_trayIcon)) g_trayInstalled = true;
+}
+
+void removeTrayIcon() {
+    if (!g_trayInstalled) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
+    g_trayInstalled = false;
+}
+
+void showFromTray() {
+    if (!g_hwnd) return;
+    ShowWindow(g_hwnd, SW_SHOW);
+    if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
+    SetForegroundWindow(g_hwnd);
+}
+
+void showTrayMenu() {
+    POINT pt; GetCursorPos(&pt);
+    HMENU hm = CreatePopupMenu();
+    AppendMenuW(hm, MF_STRING, 1, L"Show matata");
+    AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hm, MF_STRING, 2, L"Pause all");
+    AppendMenuW(hm, MF_STRING, 3, L"Resume all");
+    AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hm, MF_STRING, 4, L"Exit");
+    // Required so the menu auto-dismisses when the user clicks elsewhere.
+    SetForegroundWindow(g_hwnd);
+    int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                             pt.x, pt.y, 0, g_hwnd, nullptr);
+    DestroyMenu(hm);
+    switch (cmd) {
+        case 1: showFromTray(); break;
+        case 2: {
+            std::vector<int> ids;
+            {
+                std::lock_guard<std::mutex> lk(g_itemsMu);
+                for (auto& it : g_items)
+                    if (it->state == ItemState::Running) ids.push_back(it->id);
+            }
+            for (int id : ids) abortItem(id);
+            break;
+        }
+        case 3: {
+            std::vector<int> ids;
+            {
+                std::lock_guard<std::mutex> lk(g_itemsMu);
+                for (auto& it : g_items)
+                    if (it->state == ItemState::Aborted ||
+                        it->state == ItemState::Err) ids.push_back(it->id);
+            }
+            for (int id : ids) restartItem(id);
+            break;
+        }
+        case 4: DestroyWindow(g_hwnd); break;
     }
 }
 
@@ -2205,6 +2405,41 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
                     else if (sk == L"proxyBypass")  { readString(v, i, m.settings.proxyBypass); }
                     else if (sk == L"proxyUser")    { readString(v, i, m.settings.proxyUser); }
                     else if (sk == L"proxyPass")    { readString(v, i, m.settings.proxyPass); }
+                    else if (sk == L"siteLogins") {
+                        skipWs(v, i);
+                        if (i < v.n && v.s[i] == L'[') {
+                            ++i;
+                            while (true) {
+                                skipWs(v, i);
+                                if (i >= v.n) break;
+                                if (v.s[i] == L']') { ++i; break; }
+                                if (v.s[i] == L'{') {
+                                    ++i;
+                                    SiteLogin sl;
+                                    while (true) {
+                                        skipWs(v, i);
+                                        if (i >= v.n) break;
+                                        if (v.s[i] == L'}') { ++i; break; }
+                                        std::wstring lk;
+                                        if (!readString(v, i, lk)) break;
+                                        skipWs(v, i);
+                                        if (i >= v.n || v.s[i] != L':') break;
+                                        ++i;
+                                        skipWs(v, i);
+                                        if      (lk == L"host") readString(v, i, sl.host);
+                                        else if (lk == L"user") readString(v, i, sl.user);
+                                        else if (lk == L"pass") readString(v, i, sl.pass);
+                                        else                    skipValue(v, i);
+                                        skipWs(v, i);
+                                        if (i < v.n && v.s[i] == L',') { ++i; continue; }
+                                    }
+                                    if (!sl.host.empty()) m.settings.siteLogins.push_back(std::move(sl));
+                                }
+                                skipWs(v, i);
+                                if (i < v.n && v.s[i] == L',') { ++i; continue; }
+                            }
+                        }
+                    }
                     else                              { skipValue(v, i); }
                     skipWs(v, i);
                     if (i < v.n && v.s[i] == L',') { ++i; continue; }
@@ -2303,6 +2538,8 @@ void handleMessage(const std::wstring& json) {
             g_settings.proxyBypass  = m.settings.proxyBypass;
             g_settings.proxyUser    = m.settings.proxyUser;
             g_settings.proxyPass    = m.settings.proxyPass;
+            g_settings.siteLogins   = m.settings.siteLogins;
+            setSiteLogins(g_settings.siteLogins);
             if (wasLaunchOnStartup != g_settings.launchOnStartup)
                 applyLaunchOnStartup(g_settings.launchOnStartup);
             if (wasClipboardWatch != g_settings.clipboardWatch)
@@ -2379,7 +2616,9 @@ void handleMessage(const std::wstring& json) {
         }
     }
     else if (m.type == L"win.minimize") {
-        ShowWindow(g_hwnd, SW_MINIMIZE);
+        // Hide instead of minimize so the window leaves the taskbar and
+        // lives in the system tray. Double-click the tray icon to restore.
+        ShowWindow(g_hwnd, SW_HIDE);
     }
     else if (m.type == L"win.toggleMaximize") {
         if (IsZoomed(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
@@ -2551,6 +2790,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         onUpdateAvailable((UpdateAvailMsg*)lp);
         return 0;
     }
+    case WM_APP_TRAYICON: {
+        // lp's low word is the underlying mouse event from the tray.
+        switch (LOWORD(lp)) {
+            case WM_LBUTTONDBLCLK: showFromTray(); break;
+            case WM_RBUTTONUP:     showTrayMenu(); break;
+        }
+        return 0;
+    }
     case WM_CLIPBOARDUPDATE: {
         if (g_settings.clipboardWatch) readClipboardAndMaybeAdd();
         return 0;
@@ -2578,6 +2825,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RemoveClipboardFormatListener(hwnd);
             g_clipboardSubscribed = false;
         }
+        removeTrayIcon();
         // Tell every worker to stop; detach so we don't block teardown.
         std::lock_guard<std::mutex> lk(g_itemsMu);
         for (auto& it : g_items) {
@@ -2630,8 +2878,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     OleInitialize(nullptr);
     loadSettings();
 
-    // Push the persisted proxy config into the HTTP layer before any
-    // request gets fired (update check, downloads).
+    // Push the persisted proxy config + sites logins into the HTTP layer
+    // before any request gets fired (update check, downloads).
     {
         ProxyConfig pc;
         pc.mode   = g_settings.proxyMode;
@@ -2641,6 +2889,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
         pc.pass   = g_settings.proxyPass;
         setProxyConfig(pc);
     }
+    setSiteLogins(g_settings.siteLogins);
 
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
@@ -2687,6 +2936,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     // arrives whenever the clipboard contents change; the handler decides
     // whether the new text looks like a download URL.
     if (g_settings.clipboardWatch) applyClipboardWatch(true);
+
+    // v0.9.9: install the tray icon. The minimize button hides the window
+    // instead of going to the taskbar; double-click on tray restores.
+    installTrayIcon();
 
     if (haveCli) {
         // Add now; if WebView is still initializing, the item event will be

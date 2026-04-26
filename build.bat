@@ -23,7 +23,7 @@ set MODE=release
 if /I "%1"=="debug" set MODE=debug
 
 set CFLAGS=/nologo /EHsc /std:c++17 /W4 /permissive- /DUNICODE /D_UNICODE /I"%INC%"
-set LFLAGS=/nologo winhttp.lib ws2_32.lib shlwapi.lib advapi32.lib user32.lib bcrypt.lib
+set LFLAGS=/nologo winhttp.lib ws2_32.lib shlwapi.lib advapi32.lib user32.lib bcrypt.lib crypt32.lib
 
 rem WebView2 SDK paths (fetched by fetch-webview2.ps1).
 set WV2_INC=%ROOT%third-party\webview2\include

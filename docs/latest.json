@@ -1,5 +1,5 @@
 {
-  "version": "0.9.8.1",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.8.1/matata-0.9.8.1-setup.exe",
-  "notes": "- Removed the redundant native Windows title bar; only the custom matata titlebar shows now\n- Drag the brand/search strip to move the window; double-click to maximize\n- Resize edges + Win+Down + Aero snap still work via WS_THICKFRAME"
+  "version": "0.9.9",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9/matata-0.9.9-setup.exe",
+  "notes": "- Sites Logins: per-host credential vault\n- Authorization: Basic header preempt-sent on every matching request\n- Subdomain match via leading dot (.example.com matches cdn.example.com)\n- Passwords DPAPI-encrypted at rest in HKCU\n- Caller-provided Authorization headers always win over the vault\n- Minimize-to-tray: window hides on minimize and lives in the system tray\n- Tray menu: Show / Pause all / Resume all / Exit"
 }

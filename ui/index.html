@@ -206,6 +206,16 @@
         <input type="password" id="setProxyPass">
       </div>
 
+      <h4 class="settings-section">Sites Logins</h4>
+      <p class="muted settings-help">
+        Hosts here get an <code>Authorization: Basic</code> header preempt-sent
+        on every request. A leading dot matches subdomains
+        (<code>.example.com</code> matches <code>cdn.example.com</code>).
+        Passwords are DPAPI-encrypted at rest.
+      </p>
+      <div class="site-logins" id="siteLoginsList"></div>
+      <button class="btn-secondary" id="btnSiteLoginAdd" type="button">+ Add login</button>
+
       <h4 class="settings-section">Scheduler</h4>
       <p class="muted settings-help">
         Run downloads only inside a time window. Outside the window, the queue

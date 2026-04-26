@@ -76,4 +76,23 @@ struct ProxyConfig {
 void setProxyConfig(const ProxyConfig& cfg);
 ProxyConfig currentProxyConfig();
 
+// Sites Logins. The HTTP layer keeps the list in memory and matches by
+// case-insensitive host on every outbound request, prepending an
+// Authorization: Basic <base64(user:pass)> header if a match exists.
+// Persistence (HKCU + DPAPI-encrypted password) is the caller's job.
+struct SiteLogin {
+    std::wstring host;       // case-insensitive match against Url.host
+    std::wstring user;
+    std::wstring pass;       // plaintext in process memory; encrypted at rest
+};
+
+void setSiteLogins(std::vector<SiteLogin> logins);
+std::vector<SiteLogin> currentSiteLogins();
+
+// Returns "Authorization: Basic <base64>" (no trailing CRLF) for the given
+// host if a matching login is registered, else empty. Exposed so the
+// downloader can inject it for paths that bypass the central httpFetchBody
+// helper (e.g. segmented range workers).
+std::wstring siteAuthHeaderFor(const std::wstring& host);
+
 }

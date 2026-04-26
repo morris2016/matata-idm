@@ -743,3 +743,18 @@ input, textarea {
   background: var(--bg-row-h);
   border-color: var(--accent, #4f8ef7);
 }
+
+.site-logins {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.site-login-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.site-login-row input { font-size: 12px; padding: 4px 8px; }
+.site-login-row .ic-btn { width: 28px; height: 28px; }

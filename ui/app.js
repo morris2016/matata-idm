@@ -567,6 +567,8 @@ function fillSettings() {
   $("setProxyBypass").value       = s.proxyBypass || "";
   $("setProxyUser").value         = s.proxyUser   || "";
   $("setProxyPass").value         = s.proxyPass   || "";
+  // Sites Logins.
+  renderSiteLogins(Array.isArray(s.siteLogins) ? s.siteLogins : []);
   // Scheduler.
   $("setSchedEnabled").checked       = !!s.schedEnabled;
   $("setSchedStart").value           = minutesToHHMM(s.schedStartMinutes ?? 22*60);
@@ -590,6 +592,45 @@ function hhmmToMinutes(s) {
   if (!m) return 0;
   return Math.min(24*60 - 1, Math.max(0, parseInt(m[1],10)*60 + parseInt(m[2],10)));
 }
+function renderSiteLogins(list) {
+  const root = $("siteLoginsList");
+  root.innerHTML = "";
+  list.forEach(entry => addSiteLoginRow(entry));
+}
+
+function addSiteLoginRow(entry) {
+  const root = $("siteLoginsList");
+  const row = document.createElement("div");
+  row.className = "site-login-row";
+  row.innerHTML = `
+    <input type="text"     class="sl-host" placeholder="example.com or .example.com">
+    <input type="text"     class="sl-user" placeholder="username">
+    <input type="password" class="sl-pass" placeholder="password">
+    <button class="ic-btn sl-rm" title="Remove" type="button">
+      <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+  `;
+  if (entry) {
+    row.querySelector(".sl-host").value = entry.host || "";
+    row.querySelector(".sl-user").value = entry.user || "";
+    row.querySelector(".sl-pass").value = entry.pass || "";
+  }
+  row.querySelector(".sl-rm").addEventListener("click", () => row.remove());
+  root.appendChild(row);
+}
+
+function readSiteLogins() {
+  const out = [];
+  document.querySelectorAll("#siteLoginsList .site-login-row").forEach(row => {
+    const host = row.querySelector(".sl-host").value.trim().toLowerCase();
+    const user = row.querySelector(".sl-user").value;
+    const pass = row.querySelector(".sl-pass").value;
+    if (!host) return;
+    out.push({ host, user, pass });
+  });
+  return out;
+}
+
 function readScheduleDaysMask() {
   let mask = 0;
   document.querySelectorAll('#setSchedDays input[type=checkbox]').forEach(el => {
@@ -739,6 +780,9 @@ document.addEventListener("DOMContentLoaded", () => {
     closeModal("batchModal");
   });
 
+  // Sites Logins: Add button.
+  $("btnSiteLoginAdd").addEventListener("click", () => addSiteLoginRow());
+
   // Settings save
   $("btnSettingsSave").addEventListener("click", () => {
     const s = {
@@ -769,6 +813,8 @@ document.addEventListener("DOMContentLoaded", () => {
       proxyBypass:   $("setProxyBypass").value.trim(),
       proxyUser:     $("setProxyUser").value.trim(),
       proxyPass:     $("setProxyPass").value,
+      // Sites Logins.
+      siteLogins:    readSiteLogins(),
       // Carry forward fields the modal doesn't edit so the host doesn't
       // overwrite them with defaults.
       queuePaused:   !!state.settings.queuePaused
