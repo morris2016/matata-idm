@@ -21,6 +21,7 @@
   <div class="titlebar-actions">
     <button class="ic-btn" id="btnPauseAll" title="Pause all"><svg viewBox="0 0 16 16"><rect x="4" y="3" width="3" height="10" rx="1" fill="currentColor"/><rect x="9" y="3" width="3" height="10" rx="1" fill="currentColor"/></svg></button>
     <button class="ic-btn" id="btnResumeAll" title="Resume all"><svg viewBox="0 0 16 16"><path d="M5 3l8 5-8 5z" fill="currentColor"/></svg></button>
+    <button class="ic-btn" id="btnMenu" title="Downloads menu"><svg viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
     <button class="ic-btn" id="btnSettings" title="Settings"><svg viewBox="0 0 16 16"><path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM7 .5h2l.4 1.7a6 6 0 0 1 1.5.6l1.5-1L13.8 3l-1 1.5a6 6 0 0 1 .6 1.5l1.7.4v2l-1.7.4a6 6 0 0 1-.6 1.5l1 1.5-1.4 1.4-1.5-1a6 6 0 0 1-1.5.6L9 15.5H7l-.4-1.7a6 6 0 0 1-1.5-.6l-1.5 1L2.2 13l1-1.5a6 6 0 0 1-.6-1.5L.9 9.6v-2l1.7-.4a6 6 0 0 1 .6-1.5l-1-1.5L3.6 2.8l1.5 1a6 6 0 0 1 1.5-.6L7 .5z" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
     <span class="win-controls">
       <button class="win-btn" id="winMin" title="Minimize"><svg viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1"/></svg></button>
@@ -181,6 +182,33 @@
       <button class="btn-primary" data-close="propsModal">OK</button>
     </div>
   </div>
+</div>
+
+<!-- Downloads menu (top-right hamburger) -->
+<div class="dropdown-menu" id="downloadsMenu" hidden>
+  <div class="menu-item" data-act="pauseAll">Pause All</div>
+  <div class="menu-item" data-act="resumeAll">Start All</div>
+  <div class="menu-sep"></div>
+  <div class="menu-item" data-act="deleteCompleted">Delete All Completed</div>
+  <div class="menu-sep"></div>
+  <div class="menu-item" data-act="findFocus"><span>Find</span><span class="menu-shortcut">Ctrl+F</span></div>
+  <div class="menu-item" data-act="findNext"><span>Find Next</span><span class="menu-shortcut">F3</span></div>
+  <div class="menu-sep"></div>
+  <div class="menu-item" id="menuQueueToggle" data-act="toggleQueue">Stop queue</div>
+  <div class="menu-item submenu-host" data-act="speedLimiter">
+    <span>Speed Limiter</span><span class="menu-arrow">&#9656;</span>
+    <div class="dropdown-submenu" id="speedSubmenu">
+      <div class="menu-item" data-bps="0">Off</div>
+      <div class="menu-item" data-bps="102400">100 KB/s</div>
+      <div class="menu-item" data-bps="512000">500 KB/s</div>
+      <div class="menu-item" data-bps="1048576">1 MB/s</div>
+      <div class="menu-item" data-bps="5242880">5 MB/s</div>
+      <div class="menu-sep"></div>
+      <div class="menu-item" data-act="speedCustom">Custom&hellip;</div>
+    </div>
+  </div>
+  <div class="menu-sep"></div>
+  <div class="menu-item" data-act="options">Options</div>
 </div>
 
 <!-- Right-click context menu -->

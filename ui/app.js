@@ -291,6 +291,67 @@ function onRemove(id) {
 
 function onSettings(settings) {
   state.settings = settings || {};
+  refreshMenuFromSettings();
+}
+
+// ---- Downloads dropdown menu ---------------------------------------
+
+// Mirror current settings onto the menu items (queue toggle label + the
+// checked speed-limiter row). Called whenever settings arrive from host.
+function refreshMenuFromSettings() {
+  const queueBtn = $("menuQueueToggle");
+  if (queueBtn) {
+    queueBtn.textContent = state.settings.queuePaused ? "Start queue" : "Stop queue";
+  }
+  const submenu = $("speedSubmenu");
+  if (submenu) {
+    const cur = Number(state.settings.bandwidthBps) || 0;
+    submenu.querySelectorAll(".menu-item[data-bps]").forEach(el => {
+      el.classList.toggle("checked", Number(el.dataset.bps) === cur);
+    });
+  }
+}
+
+function openDownloadsMenu() {
+  const btn = $("btnMenu");
+  const menu = $("downloadsMenu");
+  if (!btn || !menu) return;
+  const r = btn.getBoundingClientRect();
+  menu.style.right = (window.innerWidth - r.right) + "px";
+  menu.style.top   = (r.bottom + 4) + "px";
+  menu.style.left  = "auto";
+  menu.hidden = false;
+}
+
+function closeDownloadsMenu() {
+  const menu = $("downloadsMenu");
+  if (menu) {
+    menu.hidden = true;
+    menu.querySelectorAll(".submenu-host.open").forEach(el => el.classList.remove("open"));
+  }
+}
+
+// Cycle the selection (visual highlight) through visible rows whose name
+// or url contains the current search term. Wraps at the end. If there's
+// no search term, just cycle through all visible rows.
+function findNextMatch() {
+  const rows = Array.from(document.querySelectorAll("#rows .row"));
+  if (rows.length === 0) return;
+  const term = state.search;
+  const matches = term
+    ? rows.filter(r => (r.textContent || "").toLowerCase().includes(term))
+    : rows;
+  if (matches.length === 0) {
+    toast("No matches", "info");
+    return;
+  }
+  const cur = document.querySelector("#rows .row.selected");
+  let idx = -1;
+  if (cur) idx = matches.indexOf(cur);
+  const next = matches[(idx + 1) % matches.length];
+  rows.forEach(r => r.classList.remove("selected"));
+  next.classList.add("selected");
+  next.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
 function onWindowState(ev) {
@@ -519,6 +580,58 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btnPauseAll").addEventListener("click", () => send({type:"pauseAll"}));
   $("btnResumeAll").addEventListener("click",() => send({type:"resumeAll"}));
 
+  // Downloads dropdown menu
+  $("btnMenu").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const menu = $("downloadsMenu");
+    if (menu.hidden) openDownloadsMenu();
+    else              closeDownloadsMenu();
+  });
+  document.addEventListener("click", (e) => {
+    if (!$("downloadsMenu").hidden && !e.target.closest("#downloadsMenu") &&
+        !e.target.closest("#btnMenu")) {
+      closeDownloadsMenu();
+    }
+  });
+  $("downloadsMenu").addEventListener("click", (e) => {
+    const item = e.target.closest(".menu-item");
+    if (!item) return;
+    // Speed limiter preset.
+    if (item.dataset.bps !== undefined) {
+      send({type: "setBandwidthBps", value: Number(item.dataset.bps)});
+      closeDownloadsMenu();
+      return;
+    }
+    const act = item.dataset.act;
+    if (!act) return;
+    if (act === "speedLimiter") {
+      // Don't close on hover; toggle the submenu open state for click users.
+      item.classList.toggle("open");
+      e.stopPropagation();
+      return;
+    }
+    closeDownloadsMenu();
+    switch (act) {
+      case "pauseAll":         send({type: "pauseAll"});         break;
+      case "resumeAll":        send({type: "resumeAll"});        break;
+      case "deleteCompleted":  send({type: "deleteCompleted"});  break;
+      case "findFocus":        $("search").focus(); $("search").select(); break;
+      case "findNext":         findNextMatch();                  break;
+      case "toggleQueue":
+        send({type: "setQueuePaused", value: state.settings.queuePaused ? 0 : 1});
+        break;
+      case "options":          openModal("settingsModal");       break;
+      case "speedCustom": {
+        const cur = Math.round((Number(state.settings.bandwidthBps) || 0) / 1024);
+        const v = prompt("Speed limit in KB/s (0 = unlimited):", String(cur));
+        if (v === null) break;
+        const n = Math.max(0, Math.floor(Number(v) || 0));
+        send({type: "setBandwidthBps", value: n * 1024});
+        break;
+      }
+    }
+  });
+
   // Window controls
   $("winMin").addEventListener("click",   () => send({type:"win.minimize"}));
   $("winMax").addEventListener("click",   () => send({type:"win.toggleMaximize"}));
@@ -645,10 +758,23 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       document.querySelectorAll(".modal-backdrop:not([hidden])").forEach(m => m.hidden = true);
+      closeDownloadsMenu();
     }
     if ((e.ctrlKey || e.metaKey) && e.key === "n") {
       e.preventDefault();
       openModal("addModal");
+    }
+    // Ctrl-F: focus the search box (parity with IDM's Find).
+    if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
+      e.preventDefault();
+      const s = $("search");
+      s.focus();
+      s.select();
+    }
+    // F3 / Shift-F3: cycle through visible rows matching the search.
+    if (e.key === "F3") {
+      e.preventDefault();
+      findNextMatch();
     }
   });
 

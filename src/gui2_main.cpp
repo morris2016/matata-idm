@@ -234,6 +234,10 @@ struct Settings {
     bool         clipboardWatch  = false;
     bool         verifyChecksum  = true;
     bool         categorize      = false;
+    // Global "Stop queue" toggle. When true, addDownloadEx parks new items
+    // in Queued and dispatchQueued doesn't promote anything -- already-running
+    // downloads keep going. Mirrors IDM's Downloads -> Stop queue.
+    bool         queuePaused     = false;
     int          windowX = CW_USEDEFAULT, windowY = CW_USEDEFAULT;
     int          windowW = 1180, windowH = 760;
     bool         windowMaximized = false;
@@ -269,6 +273,7 @@ void loadSettings() {
     d = g_settings.clipboardWatch ? 1 : 0; rdDword(L"clipboardWatch",  d); g_settings.clipboardWatch  = (d != 0);
     d = g_settings.verifyChecksum ? 1 : 0; rdDword(L"verifyChecksum",  d); g_settings.verifyChecksum  = (d != 0);
     d = g_settings.categorize     ? 1 : 0; rdDword(L"categorize",      d); g_settings.categorize      = (d != 0);
+    d = g_settings.queuePaused    ? 1 : 0; rdDword(L"queuePaused",     d); g_settings.queuePaused     = (d != 0);
     d = (DWORD)g_settings.windowX; rdDword(L"windowX", d); g_settings.windowX = (int)d;
     d = (DWORD)g_settings.windowY; rdDword(L"windowY", d); g_settings.windowY = (int)d;
     d = (DWORD)g_settings.windowW; rdDword(L"windowW", d); g_settings.windowW = (int)d;
@@ -299,6 +304,7 @@ void saveSettings() {
     wrDword(L"clipboardWatch",  g_settings.clipboardWatch ? 1 : 0);
     wrDword(L"verifyChecksum",  g_settings.verifyChecksum ? 1 : 0);
     wrDword(L"categorize",      g_settings.categorize     ? 1 : 0);
+    wrDword(L"queuePaused",     g_settings.queuePaused    ? 1 : 0);
     wrDword(L"windowX", (DWORD)g_settings.windowX);
     wrDword(L"windowY", (DWORD)g_settings.windowY);
     wrDword(L"windowW", (DWORD)g_settings.windowW);
@@ -457,7 +463,8 @@ std::wstring serializeSettings() {
     _snwprintf_s(buf, _TRUNCATE, L"\"bandwidthBps\":%lld,", (long long)g_settings.bandwidthBps); out += buf;
     out += L"\"clipboardWatch\":"; out += g_settings.clipboardWatch ? L"true" : L"false"; out += L",";
     out += L"\"verifyChecksum\":"; out += g_settings.verifyChecksum ? L"true" : L"false"; out += L",";
-    out += L"\"categorize\":";     out += g_settings.categorize     ? L"true" : L"false";
+    out += L"\"categorize\":";     out += g_settings.categorize     ? L"true" : L"false"; out += L",";
+    out += L"\"queuePaused\":";    out += g_settings.queuePaused    ? L"true" : L"false";
     out += L"}";
     return out;
 }
@@ -1342,15 +1349,17 @@ int addDownloadEx(const HandoffSpec& spec) {
     it->isFtp    = !it->isYtDlp && looksLikeFtpUrl(spec.url);
     // Concurrency cap: if there are already maxJobs items running, hold this
     // one as Queued. The dispatcher in onCompleted will start it later.
-    // Playlist enumeration (isYtPlaylist) is exempt — it's a fast metadata
-    // call, not a real download — so it always runs immediately.
+    // Also gate on the global queuePaused toggle (Downloads -> Stop queue).
+    // Playlist enumeration (isYtPlaylist) is exempt -- it's a fast metadata
+    // call, not a real download -- so it always runs immediately.
     int runningNow = 0;
     {
         std::lock_guard<std::mutex> lk(g_itemsMu);
         for (auto& p : g_items) if (p->state == ItemState::Running) ++runningNow;
     }
-    bool capped = !it->isYtPlaylist && g_settings.maxJobs > 0 &&
-                  runningNow >= g_settings.maxJobs;
+    bool capped = !it->isYtPlaylist && (
+                      (g_settings.maxJobs > 0 && runningNow >= g_settings.maxJobs) ||
+                      g_settings.queuePaused);
     it->state    = capped ? ItemState::Queued : ItemState::Running;
     it->startedEpoch = (int64_t)std::time(nullptr);
 
@@ -1409,6 +1418,9 @@ int addDownloadEx(const HandoffSpec& spec) {
 // Promote queued items to Running until maxJobs are in flight. Called after
 // each completion so the next pending download starts automatically.
 void dispatchQueued() {
+    // Honor the global "Stop queue" toggle: don't promote anything new.
+    // Already-running items keep going; this only blocks new starts.
+    if (g_settings.queuePaused) return;
     std::vector<int> toStart;
     {
         std::lock_guard<std::mutex> lk(g_itemsMu);
@@ -1721,6 +1733,7 @@ struct ParsedMsg {
     std::wstring type;
     std::wstring url, filename, outDir;
     int          id = 0;
+    int64_t      value = 0;     // generic numeric payload (setBandwidthBps, setQueuePaused)
     bool         hasSettings = false;
     Settings     settings;
 };
@@ -1746,6 +1759,7 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
         else if (key == L"filename"){ if (!readString(v, i, m.filename))break; }
         else if (key == L"outDir")  { if (!readString(v, i, m.outDir))  break; }
         else if (key == L"id")      { double d=0; if (!readNumber(v, i, d)) break; m.id = (int)d; }
+        else if (key == L"value")   { double d=0; if (!readNumber(v, i, d)) break; m.value = (int64_t)d; }
         else if (key == L"settings") {
             // Parse nested settings object.
             skipWs(v, i);
@@ -1769,6 +1783,7 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
                     else if (sk == L"clipboardWatch") { bool b=false; readBool(v, i, b); m.settings.clipboardWatch = b; }
                     else if (sk == L"verifyChecksum") { bool b=true;  readBool(v, i, b); m.settings.verifyChecksum = b; }
                     else if (sk == L"categorize")     { bool b=false; readBool(v, i, b); m.settings.categorize = b; }
+                    else if (sk == L"queuePaused")    { bool b=false; readBool(v, i, b); m.settings.queuePaused = b; }
                     else                              { skipValue(v, i); }
                     skipWs(v, i);
                     if (i < v.n && v.s[i] == L',') { ++i; continue; }
@@ -1868,6 +1883,41 @@ void handleMessage(const std::wstring& json) {
                 if (it->state == ItemState::Aborted || it->state == ItemState::Err) ids.push_back(it->id);
         }
         for (int id : ids) restartItem(id);
+    }
+    else if (m.type == L"deleteCompleted") {
+        // Remove every Done item. Snapshot the ids under the lock, then
+        // call removeItem (which takes the lock itself) outside.
+        std::vector<int> ids;
+        {
+            std::lock_guard<std::mutex> lk(g_itemsMu);
+            for (auto& it : g_items)
+                if (it->state == ItemState::Done) ids.push_back(it->id);
+        }
+        for (int id : ids) removeItem(id);
+        if (!ids.empty()) {
+            std::wstring msg = L"Removed " + std::to_wstring(ids.size()) +
+                               L" finished download" + (ids.size() == 1 ? L"" : L"s");
+            emitToast(msg, L"ok");
+        }
+    }
+    else if (m.type == L"setBandwidthBps") {
+        // Quick speed-limiter pick from the Downloads menu. Per-item
+        // RateLimiters don't expose a setter, so this only affects new
+        // downloads -- matches IDM's behaviour closely enough.
+        g_settings.bandwidthBps = m.value < 0 ? 0 : m.value;
+        saveSettings();
+        emitSettings();
+    }
+    else if (m.type == L"setQueuePaused") {
+        bool paused = (m.value != 0);
+        if (g_settings.queuePaused != paused) {
+            g_settings.queuePaused = paused;
+            saveSettings();
+            emitSettings();
+            // When un-pausing, promote whatever was sitting in Queued.
+            if (!paused) dispatchQueued();
+            emitToast(paused ? L"Queue stopped" : L"Queue started", L"info");
+        }
     }
     else if (m.type == L"win.minimize") {
         ShowWindow(g_hwnd, SW_MINIMIZE);
