@@ -681,6 +681,25 @@ document.addEventListener("DOMContentLoaded", () => {
   $("winMax").addEventListener("click",   () => send({type:"win.toggleMaximize"}));
   $("winClose").addEventListener("click", () => send({type:"win.close"}));
 
+  // Titlebar drag: with the OS chrome removed, the .titlebar-drag area is
+  // what the user grabs to move the window. mousedown -> host triggers
+  // WM_NCLBUTTONDOWN(HTCAPTION) which lets the OS take over from there.
+  // dblclick toggles maximize, matching native title-bar behavior.
+  document.querySelectorAll(".titlebar-drag").forEach(el => {
+    el.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      // Don't hijack drags that started inside an interactive child
+      // (search input, brand link area can be neutral). Searchbox is
+      // inside .titlebar-drag, so skip when target is the input itself.
+      if (e.target.closest("input, button, select, textarea, [contenteditable]")) return;
+      send({type: "win.beginDrag"});
+    });
+    el.addEventListener("dblclick", (e) => {
+      if (e.target.closest("input, button, select, textarea, [contenteditable]")) return;
+      send({type: "win.toggleMaximize"});
+    });
+  });
+
   // Modal closes
   document.querySelectorAll("[data-close]").forEach(el => {
     el.addEventListener("click", () => closeModal(el.dataset.close));

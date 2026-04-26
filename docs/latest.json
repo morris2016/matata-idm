@@ -1,5 +1,5 @@
 {
-  "version": "0.9.8",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.8/matata-0.9.8-setup.exe",
-  "notes": "- Proxy / Socks: System / None / Manual HTTP / Manual SOCKS5\n- HTTP downloads route through the configured WinHTTP proxy\n- yt-dlp invocations honour the same proxy (HTTP and SOCKS5)\n- Optional username + password for proxy auth\n- Bypass list (semicolon-separated; <local> for intranet)"
+  "version": "0.9.8.1",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.8.1/matata-0.9.8.1-setup.exe",
+  "notes": "- Removed the redundant native Windows title bar; only the custom matata titlebar shows now\n- Drag the brand/search strip to move the window; double-click to maximize\n- Resize edges + Win+Down + Aero snap still work via WS_THICKFRAME"
 }

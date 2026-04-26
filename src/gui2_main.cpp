@@ -2385,6 +2385,13 @@ void handleMessage(const std::wstring& json) {
         if (IsZoomed(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
         else                  ShowWindow(g_hwnd, SW_MAXIMIZE);
     }
+    else if (m.type == L"win.beginDrag") {
+        // The OS title bar is gone (WS_POPUP), so the user drags the window
+        // by mousedown'ing the .titlebar-drag div in the WebView. Hand off
+        // to the OS via the standard "fake an HTCAPTION click" pattern.
+        ReleaseCapture();
+        SendMessageW(g_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
     else if (m.type == L"win.close") {
         DestroyWindow(g_hwnd);
     }
@@ -2647,8 +2654,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     wc.hIconSm       = LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
+    // Borderless top-level window: drop the OS title bar so only our custom
+    // titlebar (rendered in the WebView) is visible. WS_THICKFRAME keeps OS
+    // resize edges; WS_MINIMIZE/MAXIMIZE/SYSMENU keep taskbar interactions
+    // (Win+Down minimize, snap, etc.). Window dragging is wired through the
+    // JS bridge -> WM_NCLBUTTONDOWN(HTCAPTION).
     g_hwnd = CreateWindowExW(0, kClassName, kAppTitle,
-        WS_OVERLAPPEDWINDOW,
+        WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU,
         g_settings.windowX, g_settings.windowY,
         g_settings.windowW, g_settings.windowH,
         nullptr, nullptr, hInst, nullptr);
