@@ -552,6 +552,15 @@ function fillSettings() {
   $("setBwKbps").value            = Math.floor((s.bandwidthBps || 0) / 1024);
   $("setClipWatch").checked       = !!s.clipboardWatch;
   $("setVerifyChecksum").checked  = s.verifyChecksum !== false;
+  // General-tab additions (v0.9.7).
+  $("setLaunchOnStartup").checked = !!s.launchOnStartup;
+  $("setSoundOnComplete").checked = s.soundOnComplete !== false;
+  $("setCategorize").checked      = !!s.categorize;
+  $("setCatDirVideo").value       = s.catDirVideo    || "";
+  $("setCatDirMusic").value       = s.catDirMusic    || "";
+  $("setCatDirArchive").value     = s.catDirArchive  || "";
+  $("setCatDirProgram").value     = s.catDirProgram  || "";
+  $("setCatDirDocument").value    = s.catDirDocument || "";
   // Scheduler.
   $("setSchedEnabled").checked       = !!s.schedEnabled;
   $("setSchedStart").value           = minutesToHHMM(s.schedStartMinutes ?? 22*60);
@@ -720,9 +729,17 @@ document.addEventListener("DOMContentLoaded", () => {
       schedStopMinutes:   hhmmToMinutes($("setSchedStop").value),
       schedDaysMask:      readScheduleDaysMask(),
       schedShutdownDone:  $("setSchedShutdownDone").checked,
+      // General-tab additions (v0.9.7).
+      launchOnStartup:   $("setLaunchOnStartup").checked,
+      soundOnComplete:   $("setSoundOnComplete").checked,
+      categorize:        $("setCategorize").checked,
+      catDirVideo:       $("setCatDirVideo").value.trim(),
+      catDirMusic:       $("setCatDirMusic").value.trim(),
+      catDirArchive:     $("setCatDirArchive").value.trim(),
+      catDirProgram:     $("setCatDirProgram").value.trim(),
+      catDirDocument:    $("setCatDirDocument").value.trim(),
       // Carry forward fields the modal doesn't edit so the host doesn't
       // overwrite them with defaults.
-      categorize:    !!state.settings.categorize,
       queuePaused:   !!state.settings.queuePaused
     };
     send({type:"setSettings", settings: s});

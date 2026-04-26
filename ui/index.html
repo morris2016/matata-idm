@@ -148,6 +148,34 @@
           <input type="checkbox" id="setVerifyChecksum">
           Verify checksums when servers advertise them
         </label>
+
+        <label class="checkbox">
+          <input type="checkbox" id="setLaunchOnStartup">
+          Launch matata on Windows startup
+        </label>
+
+        <label class="checkbox">
+          <input type="checkbox" id="setSoundOnComplete">
+          Sound when a download completes or fails
+        </label>
+      </div>
+
+      <h4 class="settings-section">Save to (per category)</h4>
+      <p class="muted settings-help">
+        Used when "Categorize downloads" is on (right above) and a download
+        has no explicit folder. Blank = use the default folder.
+      </p>
+      <div class="settings-grid">
+        <label>Video</label>     <input type="text" id="setCatDirVideo"    placeholder="(default folder)">
+        <label>Music</label>     <input type="text" id="setCatDirMusic"    placeholder="(default folder)">
+        <label>Archive</label>   <input type="text" id="setCatDirArchive"  placeholder="(default folder)">
+        <label>Program</label>   <input type="text" id="setCatDirProgram"  placeholder="(default folder)">
+        <label>Document</label>  <input type="text" id="setCatDirDocument" placeholder="(default folder)">
+        <label class="checkbox">
+          <input type="checkbox" id="setCategorize">
+          Categorize downloads (use the per-type folders above)
+        </label>
+        <span></span>
       </div>
 
       <h4 class="settings-section">Scheduler</h4>

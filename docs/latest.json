@@ -1,5 +1,5 @@
 {
-  "version": "0.9.6",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.6/matata-0.9.6-setup.exe",
-  "notes": "- Scheduler: run downloads only inside a configured time window\n- Per-day-of-week toggles (Sun-Sat); window can wrap midnight\n- Optional 'Shut down PC when downloads complete' (60s grace, abort with shutdown /a)\n- Auto-pause queue + abort active downloads at the Stop edge\n- Auto-resume queue at the Start edge"
+  "version": "0.9.7",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.7/matata-0.9.7-setup.exe",
+  "notes": "- Launch matata on Windows startup (HKCU Run entry)\n- Sound on download complete or fail (toggleable)\n- Save-to per category: Video / Music / Archive / Program / Document folders\n- Real clipboard auto-add: copying a download URL queues it automatically\n- Settings layout: General + Save-to + Scheduler sections"
 }

@@ -20,6 +20,7 @@
 
 #include "WebView2.h"
 
+#include "matata/categories.hpp"
 #include "matata/downloader.hpp"
 #include "matata/ftp_downloader.hpp"
 #include "matata/hls.hpp"
@@ -250,6 +251,16 @@ struct Settings {
     int          schedStopMinutes    = 7  * 60;   // 07:00
     int          schedDaysMask       = 0x7F;      // every day
     bool         schedShutdownDone   = false;
+    // v0.9.7 General-tab additions.
+    bool         launchOnStartup     = false;   // HKCU\...\Run entry
+    bool         soundOnComplete     = true;    // MessageBeep on Done/Err
+    // Per-category download folders. Blank = fall through to outputDir.
+    // Used only when categorize=true and the item has no explicit outDir.
+    std::wstring catDirVideo;
+    std::wstring catDirMusic;
+    std::wstring catDirArchive;
+    std::wstring catDirProgram;
+    std::wstring catDirDocument;
     int          windowX = CW_USEDEFAULT, windowY = CW_USEDEFAULT;
     int          windowW = 1180, windowH = 760;
     bool         windowMaximized = false;
@@ -291,6 +302,13 @@ void loadSettings() {
     d = (DWORD)g_settings.schedStopMinutes;  rdDword(L"schedStopMinutes",  d); g_settings.schedStopMinutes  = (int)d;
     d = (DWORD)g_settings.schedDaysMask;     rdDword(L"schedDaysMask",     d); g_settings.schedDaysMask     = (int)d;
     d = g_settings.schedShutdownDone ? 1 : 0; rdDword(L"schedShutdownDone", d); g_settings.schedShutdownDone = (d != 0);
+    d = g_settings.launchOnStartup ? 1 : 0; rdDword(L"launchOnStartup", d); g_settings.launchOnStartup = (d != 0);
+    d = g_settings.soundOnComplete ? 1 : 0; rdDword(L"soundOnComplete", d); g_settings.soundOnComplete = (d != 0);
+    rdString(L"catDirVideo",    g_settings.catDirVideo);
+    rdString(L"catDirMusic",    g_settings.catDirMusic);
+    rdString(L"catDirArchive",  g_settings.catDirArchive);
+    rdString(L"catDirProgram",  g_settings.catDirProgram);
+    rdString(L"catDirDocument", g_settings.catDirDocument);
     d = (DWORD)g_settings.windowX; rdDword(L"windowX", d); g_settings.windowX = (int)d;
     d = (DWORD)g_settings.windowY; rdDword(L"windowY", d); g_settings.windowY = (int)d;
     d = (DWORD)g_settings.windowW; rdDword(L"windowW", d); g_settings.windowW = (int)d;
@@ -327,6 +345,13 @@ void saveSettings() {
     wrDword(L"schedStopMinutes",  (DWORD)g_settings.schedStopMinutes);
     wrDword(L"schedDaysMask",     (DWORD)g_settings.schedDaysMask);
     wrDword(L"schedShutdownDone", g_settings.schedShutdownDone ? 1 : 0);
+    wrDword(L"launchOnStartup", g_settings.launchOnStartup ? 1 : 0);
+    wrDword(L"soundOnComplete", g_settings.soundOnComplete ? 1 : 0);
+    wrString(L"catDirVideo",    g_settings.catDirVideo);
+    wrString(L"catDirMusic",    g_settings.catDirMusic);
+    wrString(L"catDirArchive",  g_settings.catDirArchive);
+    wrString(L"catDirProgram",  g_settings.catDirProgram);
+    wrString(L"catDirDocument", g_settings.catDirDocument);
     wrDword(L"windowX", (DWORD)g_settings.windowX);
     wrDword(L"windowY", (DWORD)g_settings.windowY);
     wrDword(L"windowW", (DWORD)g_settings.windowW);
@@ -491,7 +516,14 @@ std::wstring serializeSettings() {
     _snwprintf_s(buf, _TRUNCATE, L"\"schedStartMinutes\":%d,", g_settings.schedStartMinutes); out += buf;
     _snwprintf_s(buf, _TRUNCATE, L"\"schedStopMinutes\":%d,",  g_settings.schedStopMinutes);  out += buf;
     _snwprintf_s(buf, _TRUNCATE, L"\"schedDaysMask\":%d,",     g_settings.schedDaysMask);     out += buf;
-    out += L"\"schedShutdownDone\":"; out += g_settings.schedShutdownDone ? L"true" : L"false";
+    out += L"\"schedShutdownDone\":"; out += g_settings.schedShutdownDone ? L"true" : L"false"; out += L",";
+    out += L"\"launchOnStartup\":";   out += g_settings.launchOnStartup   ? L"true" : L"false"; out += L",";
+    out += L"\"soundOnComplete\":";   out += g_settings.soundOnComplete   ? L"true" : L"false"; out += L",";
+    out += L"\"catDirVideo\":";       out += quoteJson(g_settings.catDirVideo);    out += L",";
+    out += L"\"catDirMusic\":";       out += quoteJson(g_settings.catDirMusic);    out += L",";
+    out += L"\"catDirArchive\":";     out += quoteJson(g_settings.catDirArchive);  out += L",";
+    out += L"\"catDirProgram\":";     out += quoteJson(g_settings.catDirProgram);  out += L",";
+    out += L"\"catDirDocument\":";    out += quoteJson(g_settings.catDirDocument);
     out += L"}";
     return out;
 }
@@ -620,6 +652,7 @@ std::atomic<bool> g_schedShutdownArmed{false};
 // Forward decls: these helpers live in item-ops further down.
 void dispatchQueued();
 void abortItem(int id);
+int  addDownloadEx(const HandoffSpec& spec);
 
 // Returns minutes-since-midnight for the local clock now, plus the day of
 // week in 0..6 with 0 = Sunday (matches schedDaysMask bit ordering).
@@ -763,6 +796,127 @@ void schedulerWorker() {
         // Sleep in 1s slices so app shutdown isn't held up by the tick rate.
         for (int i = 0; i < 30 && !g_schedExitFlag.load(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+// ---- v0.9.7 General-tab helpers ------------------------------------
+
+// HKCU\Software\Microsoft\Windows\CurrentVersion\Run\matata-gui:
+//   on  -> set REG_SZ to "<exe path>"
+//   off -> delete the value
+void applyLaunchOnStartup(bool enable) {
+    const wchar_t* subkey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0,
+                      KEY_SET_VALUE | KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS) {
+        dbgLog(L"applyLaunchOnStartup: open Run key failed err=%lu", GetLastError());
+        return;
+    }
+    if (enable) {
+        wchar_t path[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring quoted = L"\"";
+            quoted += path;
+            quoted += L"\"";
+            RegSetValueExW(hk, L"matata-gui", 0, REG_SZ,
+                           (const BYTE*)quoted.c_str(),
+                           (DWORD)((quoted.size() + 1) * sizeof(wchar_t)));
+        }
+    } else {
+        RegDeleteValueW(hk, L"matata-gui");
+    }
+    RegCloseKey(hk);
+}
+
+// Map matata's Category::name -> the per-category folder setting. Empty
+// string means "fall through to outputDir" -- the caller handles that.
+const std::wstring& categoryFolder(const std::wstring& categoryName) {
+    static const std::wstring empty;
+    if      (categoryName == L"video")    return g_settings.catDirVideo;
+    else if (categoryName == L"music")    return g_settings.catDirMusic;
+    else if (categoryName == L"archive")  return g_settings.catDirArchive;
+    else if (categoryName == L"program")  return g_settings.catDirProgram;
+    else if (categoryName == L"document") return g_settings.catDirDocument;
+    return empty;
+}
+
+// Heuristic: should clipboard text trigger an auto-add?
+//   - http/https/ftp/ftps URL
+//   - either ends in a known download extension, or is a YouTube/Vimeo URL
+//     (the rest of the pipeline handles the video extraction)
+bool clipboardLooksLikeDownload(const std::wstring& s) {
+    if (s.size() < 8 || s.size() > 4096) return false;
+    std::wstring low;
+    low.reserve(s.size());
+    for (wchar_t c : s) low.push_back((wchar_t)towlower(c));
+    if (low.compare(0, 7, L"http://")  != 0 &&
+        low.compare(0, 8, L"https://") != 0 &&
+        low.compare(0, 6, L"ftp://")   != 0 &&
+        low.compare(0, 7, L"ftps://")  != 0) {
+        return false;
+    }
+    if (low.find(L'\n') != std::wstring::npos ||
+        low.find(L'\r') != std::wstring::npos ||
+        low.find(L' ')  != std::wstring::npos) return false;
+    if (looksLikeYouTubeUrl(s) || looksLikeVideoUrl(s)) return true;
+    auto qm = low.find(L'?');
+    std::wstring path = (qm == std::wstring::npos) ? low : low.substr(0, qm);
+    auto dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = path.substr(dot + 1);
+    return categorize(L"x." + ext)->name != L"other";
+}
+
+std::wstring g_lastClipboardUrl;
+bool         g_clipboardSubscribed = false;
+
+void readClipboardAndMaybeAdd() {
+    if (!OpenClipboard(g_hwnd)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    std::wstring text;
+    if (h) {
+        const wchar_t* p = (const wchar_t*)GlobalLock(h);
+        if (p) {
+            text = p;
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' ||
+                              text.back() == L' ' || text.back() == L'\t'))
+        text.pop_back();
+    while (!text.empty() && (text.front() == L'\r' || text.front() == L'\n' ||
+                              text.front() == L' ' || text.front() == L'\t'))
+        text.erase(text.begin());
+    if (text.empty() || text == g_lastClipboardUrl) return;
+    if (!clipboardLooksLikeDownload(text)) return;
+    g_lastClipboardUrl = text;
+    HandoffSpec spec;
+    spec.url = text;
+    addDownloadEx(spec);
+    emitToast(L"Auto-added from clipboard", L"info");
+}
+
+void applyClipboardWatch(bool enable) {
+    if (enable && !g_clipboardSubscribed) {
+        if (g_hwnd && AddClipboardFormatListener(g_hwnd)) {
+            g_clipboardSubscribed = true;
+            // Seed last-seen so we don't immediately re-add an existing URL.
+            if (OpenClipboard(g_hwnd)) {
+                HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                if (h) {
+                    const wchar_t* p = (const wchar_t*)GlobalLock(h);
+                    if (p) g_lastClipboardUrl = p;
+                    if (h)  GlobalUnlock(h);
+                }
+                CloseClipboard();
+            }
+        }
+    } else if (!enable && g_clipboardSubscribed) {
+        if (g_hwnd) RemoveClipboardFormatListener(g_hwnd);
+        g_clipboardSubscribed = false;
+        g_lastClipboardUrl.clear();
     }
 }
 
@@ -1498,6 +1652,29 @@ std::wstring resolveOutDir(const std::wstring& perItem) {
     return perItem.empty() ? g_settings.outputDir : perItem;
 }
 
+// Like resolveOutDir but, when categorize is on and the user hasn't given
+// a per-item folder, route the file into its category's folder. Filename
+// is needed because category routing is by file extension. Caller still
+// passes the raw user input through perItem to win over categorization.
+std::wstring resolveOutDirForFile(const std::wstring& perItem,
+                                  const std::wstring& filename,
+                                  const std::wstring& url) {
+    if (!perItem.empty()) return perItem;
+    if (!g_settings.categorize) return g_settings.outputDir;
+    std::wstring forCat = filename;
+    if (forCat.empty()) {
+        Url u; std::wstring err;
+        if (parseUrl(url, u, err)) forCat = u.inferredFilename();
+    }
+    if (forCat.empty()) return g_settings.outputDir;
+    const Category* cat = categorize(forCat);
+    if (cat) {
+        const std::wstring& folder = categoryFolder(cat->name);
+        if (!folder.empty()) return folder;
+    }
+    return g_settings.outputDir;
+}
+
 int addDownloadEx(const HandoffSpec& spec) {
     if (spec.url.empty()) return 0;
     // Deduplicate: if the same URL is already running (or queued), bring
@@ -1526,7 +1703,7 @@ int addDownloadEx(const HandoffSpec& spec) {
     it->id       = g_nextId.fetch_add(1);
     it->url      = spec.url;
     it->filename = spec.filename;
-    it->outDir   = resolveOutDir(spec.outDir);
+    it->outDir   = resolveOutDirForFile(spec.outDir, spec.filename, spec.url);
     it->isYtDlp  = ytMatch;
     it->isYtPlaylist = it->isYtDlp && looksLikeYouTubePlaylistUrl(spec.url);
     it->isVideo  = !it->isYtDlp && looksLikeVideoUrl(spec.url);
@@ -1817,8 +1994,10 @@ void onCompleted(CompleteMsg* m) {
     emitItem(snap);
     if (m->status == DownloadStatus::Ok) {
         emitToast(L"Download complete: " + (snap.filename.empty() ? snap.url : snap.filename), L"ok");
+        if (g_settings.soundOnComplete) MessageBeep(MB_ICONINFORMATION);
     } else if (m->status != DownloadStatus::Aborted) {
         emitToast(L"Download failed: " + m->message, L"err");
+        if (g_settings.soundOnComplete) MessageBeep(MB_ICONERROR);
     }
     // Promote the next queued item to Running, respecting maxJobs.
     dispatchQueued();
@@ -1973,6 +2152,13 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
                     else if (sk == L"schedStopMinutes")  { double d=0; readNumber(v, i, d); m.settings.schedStopMinutes  = (int)d; }
                     else if (sk == L"schedDaysMask")     { double d=0; readNumber(v, i, d); m.settings.schedDaysMask     = (int)d; }
                     else if (sk == L"schedShutdownDone") { bool b=false; readBool(v, i, b); m.settings.schedShutdownDone = b; }
+                    else if (sk == L"launchOnStartup") { bool b=false; readBool(v, i, b); m.settings.launchOnStartup = b; }
+                    else if (sk == L"soundOnComplete") { bool b=true;  readBool(v, i, b); m.settings.soundOnComplete = b; }
+                    else if (sk == L"catDirVideo")     { readString(v, i, m.settings.catDirVideo); }
+                    else if (sk == L"catDirMusic")     { readString(v, i, m.settings.catDirMusic); }
+                    else if (sk == L"catDirArchive")   { readString(v, i, m.settings.catDirArchive); }
+                    else if (sk == L"catDirProgram")   { readString(v, i, m.settings.catDirProgram); }
+                    else if (sk == L"catDirDocument")  { readString(v, i, m.settings.catDirDocument); }
                     else                              { skipValue(v, i); }
                     skipWs(v, i);
                     if (i < v.n && v.s[i] == L',') { ++i; continue; }
@@ -2053,6 +2239,22 @@ void handleMessage(const std::wstring& json) {
             g_settings.schedStopMinutes   = m.settings.schedStopMinutes;
             g_settings.schedDaysMask      = m.settings.schedDaysMask & 0x7F;
             g_settings.schedShutdownDone  = m.settings.schedShutdownDone;
+            // v0.9.7 General-tab fields. Side effects on transition are
+            // wired below: launch-on-startup writes/clears HKCU\Run, and
+            // the clipboard watcher subscribes/unsubscribes.
+            bool wasLaunchOnStartup = g_settings.launchOnStartup;
+            bool wasClipboardWatch  = g_settings.clipboardWatch;
+            g_settings.launchOnStartup    = m.settings.launchOnStartup;
+            g_settings.soundOnComplete    = m.settings.soundOnComplete;
+            g_settings.catDirVideo        = m.settings.catDirVideo;
+            g_settings.catDirMusic        = m.settings.catDirMusic;
+            g_settings.catDirArchive      = m.settings.catDirArchive;
+            g_settings.catDirProgram      = m.settings.catDirProgram;
+            g_settings.catDirDocument     = m.settings.catDirDocument;
+            if (wasLaunchOnStartup != g_settings.launchOnStartup)
+                applyLaunchOnStartup(g_settings.launchOnStartup);
+            if (wasClipboardWatch != g_settings.clipboardWatch)
+                applyClipboardWatch(g_settings.clipboardWatch);
             saveSettings();
             emitSettings();
             emitToast(L"Settings saved", L"ok");
@@ -2279,6 +2481,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         onUpdateAvailable((UpdateAvailMsg*)lp);
         return 0;
     }
+    case WM_CLIPBOARDUPDATE: {
+        if (g_settings.clipboardWatch) readClipboardAndMaybeAdd();
+        return 0;
+    }
     case WM_COPYDATA: {
         auto cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
         if (!cds || cds->dwData != kHandoffMagic) return 0;
@@ -2298,6 +2504,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         saveSettings();
         // Stop the scheduler tick before the rest of teardown.
         g_schedExitFlag.store(true);
+        if (g_clipboardSubscribed) {
+            RemoveClipboardFormatListener(hwnd);
+            g_clipboardSubscribed = false;
+        }
         // Tell every worker to stop; detach so we don't block teardown.
         std::lock_guard<std::mutex> lk(g_itemsMu);
         for (auto& it : g_items) {
@@ -2385,6 +2595,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     // window, optional shutdown-when-done. Stops via g_schedExitFlag from
     // WM_DESTROY; detached so a hung shutdown.exe call can't block teardown.
     std::thread(schedulerWorker).detach();
+
+    // v0.9.7: subscribe to the OS clipboard if enabled. WM_CLIPBOARDUPDATE
+    // arrives whenever the clipboard contents change; the handler decides
+    // whether the new text looks like a download URL.
+    if (g_settings.clipboardWatch) applyClipboardWatch(true);
 
     if (haveCli) {
         // Add now; if WebView is still initializing, the item event will be
