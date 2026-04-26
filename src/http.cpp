@@ -18,6 +18,17 @@ std::mutex          g_sessionMu;
 HINTERNET           g_session = nullptr;
 std::atomic<int>    g_sessionRefs{0};
 
+// Proxy state. Guarded by g_proxyMu; copied into the session at open
+// and applied per-request below.
+std::mutex          g_proxyMu;
+ProxyConfig         g_proxyCfg;
+bool                g_sessionStale = false;  // proxy changed -> rebuild
+
+ProxyConfig snapshotProxy() {
+    std::lock_guard<std::mutex> lk(g_proxyMu);
+    return g_proxyCfg;
+}
+
 std::wstring lastErrWinHttp(const wchar_t* op) {
     DWORD e = GetLastError();
     std::wostringstream ss;
@@ -142,11 +153,27 @@ void enableHttp2(HINTERNET session) {
 
 void* HttpSession::acquire() {
     std::lock_guard<std::mutex> lk(g_sessionMu);
+    // If proxy settings changed and no requests are in flight, drop the
+    // current session so we can rebuild it with the new proxy config.
+    if (g_session && g_sessionStale && g_sessionRefs.load() == 0) {
+        WinHttpCloseHandle(g_session);
+        g_session = nullptr;
+        g_sessionStale = false;
+    }
     if (!g_session) {
+        ProxyConfig cfg = snapshotProxy();
+        DWORD accessType = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+        const wchar_t* proxyName = WINHTTP_NO_PROXY_NAME;
+        const wchar_t* proxyBypass = WINHTTP_NO_PROXY_BYPASS;
+        if (cfg.mode == 1) {
+            accessType = WINHTTP_ACCESS_TYPE_NO_PROXY;
+        } else if (cfg.mode == 2 && !cfg.server.empty()) {
+            accessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+            proxyName = cfg.server.c_str();
+            if (!cfg.bypass.empty()) proxyBypass = cfg.bypass.c_str();
+        }
         g_session = WinHttpOpen(L"matata/0.2",
-                                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                WINHTTP_NO_PROXY_NAME,
-                                WINHTTP_NO_PROXY_BYPASS, 0);
+                                accessType, proxyName, proxyBypass, 0);
         if (g_session) enableHttp2(g_session);
     }
     if (g_session) g_sessionRefs++;
@@ -159,8 +186,52 @@ void HttpSession::release() {
     if (g_sessionRefs == 0 && g_session) {
         WinHttpCloseHandle(g_session);
         g_session = nullptr;
+        g_sessionStale = false;
     }
 }
+
+void HttpSession::resetForReconfig() {
+    std::lock_guard<std::mutex> lk(g_sessionMu);
+    g_sessionStale = true;
+    if (g_session && g_sessionRefs.load() == 0) {
+        WinHttpCloseHandle(g_session);
+        g_session = nullptr;
+        g_sessionStale = false;
+    }
+}
+
+void setProxyConfig(const ProxyConfig& cfg) {
+    {
+        std::lock_guard<std::mutex> lk(g_proxyMu);
+        g_proxyCfg = cfg;
+    }
+    HttpSession::resetForReconfig();
+}
+
+ProxyConfig currentProxyConfig() { return snapshotProxy(); }
+
+namespace {
+
+// Apply per-request proxy settings: when manual mode and creds are set,
+// stamp them onto the request handle so WinHTTP sends them on the first
+// proxy challenge. No-op for system/none modes.
+void applyProxyAuth(HINTERNET hReq) {
+    ProxyConfig cfg = snapshotProxy();
+    if (cfg.mode != 2) return;
+    if (cfg.user.empty() && cfg.pass.empty()) return;
+    if (!cfg.user.empty()) {
+        WinHttpSetOption(hReq, WINHTTP_OPTION_PROXY_USERNAME,
+                         (LPVOID)cfg.user.c_str(),
+                         (DWORD)(cfg.user.size() * sizeof(wchar_t)));
+    }
+    if (!cfg.pass.empty()) {
+        WinHttpSetOption(hReq, WINHTTP_OPTION_PROXY_PASSWORD,
+                         (LPVOID)cfg.pass.c_str(),
+                         (DWORD)(cfg.pass.size() * sizeof(wchar_t)));
+    }
+}
+
+} // anon
 
 bool probeResource(const Url& url, const ExtraHeaders& headers,
                    ResourceInfo& info, std::wstring& err) {
@@ -177,6 +248,7 @@ bool probeResource(const Url& url, const ExtraHeaders& headers,
     }
 
     std::wstring hdrBlock = buildHeaders(headers, L"Range: bytes=0-0\r\n");
+    applyProxyAuth(req);
 
     BOOL ok = WinHttpSendRequest(req, hdrBlock.c_str(), (DWORD)-1L,
                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
@@ -284,6 +356,7 @@ int httpGetRange(const Url& url, const RangeRequest& range,
         rangeHdr = ss.str();
     }
     std::wstring hdrBlock = buildHeaders(headers, rangeHdr);
+    applyProxyAuth(req);
 
     BOOL ok = WinHttpSendRequest(req,
                                  hdrBlock.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS

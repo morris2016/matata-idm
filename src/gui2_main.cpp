@@ -22,6 +22,7 @@
 
 #include "matata/categories.hpp"
 #include "matata/downloader.hpp"
+#include "matata/http.hpp"
 #include "matata/ftp_downloader.hpp"
 #include "matata/hls.hpp"
 #include "matata/dash.hpp"
@@ -261,6 +262,12 @@ struct Settings {
     std::wstring catDirArchive;
     std::wstring catDirProgram;
     std::wstring catDirDocument;
+    // v0.9.8 Proxy.
+    int          proxyMode      = 0;     // 0=system, 1=none, 2=manual
+    std::wstring proxyServer;            // "host:port"
+    std::wstring proxyBypass;            // ";"-separated list, or "<local>"
+    std::wstring proxyUser;
+    std::wstring proxyPass;              // plaintext for now; v0.9.9 to DPAPI
     int          windowX = CW_USEDEFAULT, windowY = CW_USEDEFAULT;
     int          windowW = 1180, windowH = 760;
     bool         windowMaximized = false;
@@ -309,6 +316,11 @@ void loadSettings() {
     rdString(L"catDirArchive",  g_settings.catDirArchive);
     rdString(L"catDirProgram",  g_settings.catDirProgram);
     rdString(L"catDirDocument", g_settings.catDirDocument);
+    d = (DWORD)g_settings.proxyMode; rdDword(L"proxyMode", d); g_settings.proxyMode = (int)d;
+    rdString(L"proxyServer", g_settings.proxyServer);
+    rdString(L"proxyBypass", g_settings.proxyBypass);
+    rdString(L"proxyUser",   g_settings.proxyUser);
+    rdString(L"proxyPass",   g_settings.proxyPass);
     d = (DWORD)g_settings.windowX; rdDword(L"windowX", d); g_settings.windowX = (int)d;
     d = (DWORD)g_settings.windowY; rdDword(L"windowY", d); g_settings.windowY = (int)d;
     d = (DWORD)g_settings.windowW; rdDword(L"windowW", d); g_settings.windowW = (int)d;
@@ -352,6 +364,11 @@ void saveSettings() {
     wrString(L"catDirArchive",  g_settings.catDirArchive);
     wrString(L"catDirProgram",  g_settings.catDirProgram);
     wrString(L"catDirDocument", g_settings.catDirDocument);
+    wrDword(L"proxyMode", (DWORD)g_settings.proxyMode);
+    wrString(L"proxyServer", g_settings.proxyServer);
+    wrString(L"proxyBypass", g_settings.proxyBypass);
+    wrString(L"proxyUser",   g_settings.proxyUser);
+    wrString(L"proxyPass",   g_settings.proxyPass);
     wrDword(L"windowX", (DWORD)g_settings.windowX);
     wrDword(L"windowY", (DWORD)g_settings.windowY);
     wrDword(L"windowW", (DWORD)g_settings.windowW);
@@ -523,7 +540,12 @@ std::wstring serializeSettings() {
     out += L"\"catDirMusic\":";       out += quoteJson(g_settings.catDirMusic);    out += L",";
     out += L"\"catDirArchive\":";     out += quoteJson(g_settings.catDirArchive);  out += L",";
     out += L"\"catDirProgram\":";     out += quoteJson(g_settings.catDirProgram);  out += L",";
-    out += L"\"catDirDocument\":";    out += quoteJson(g_settings.catDirDocument);
+    out += L"\"catDirDocument\":";    out += quoteJson(g_settings.catDirDocument);  out += L",";
+    _snwprintf_s(buf, _TRUNCATE, L"\"proxyMode\":%d,", g_settings.proxyMode); out += buf;
+    out += L"\"proxyServer\":";       out += quoteJson(g_settings.proxyServer);     out += L",";
+    out += L"\"proxyBypass\":";       out += quoteJson(g_settings.proxyBypass);     out += L",";
+    out += L"\"proxyUser\":";         out += quoteJson(g_settings.proxyUser);       out += L",";
+    out += L"\"proxyPass\":";         out += quoteJson(g_settings.proxyPass);
     out += L"}";
     return out;
 }
@@ -898,6 +920,22 @@ void readClipboardAndMaybeAdd() {
     emitToast(L"Auto-added from clipboard", L"info");
 }
 
+// Build the yt-dlp `--proxy <url>` argument from current settings, or "" if
+// no manual proxy is configured. Mode 2 = http, mode 3 = socks5. WinHTTP
+// only honours mode 2; mode 3 still works here because yt-dlp speaks SOCKS5
+// natively. Caller must already have a leading space if needed.
+std::wstring ytDlpProxyArg() {
+    if (g_settings.proxyMode != 2 && g_settings.proxyMode != 3) return L"";
+    if (g_settings.proxyServer.empty()) return L"";
+    const wchar_t* scheme = (g_settings.proxyMode == 3) ? L"socks5://" : L"http://";
+    std::wstring auth;
+    if (!g_settings.proxyUser.empty() || !g_settings.proxyPass.empty()) {
+        auth = g_settings.proxyUser + L":" + g_settings.proxyPass + L"@";
+    }
+    std::wstring url = scheme + auth + g_settings.proxyServer;
+    return L" --proxy \"" + url + L"\"";
+}
+
 void applyClipboardWatch(bool enable) {
     if (enable && !g_clipboardSubscribed) {
         if (g_hwnd && AddClipboardFormatListener(g_hwnd)) {
@@ -1090,6 +1128,8 @@ void workerYtDlpPlaylist(int id) {
     // the field separator so each emitted line has the form
     //   "<playlist_title>\t<id>\t<title>".
     cmd += L" --flat-playlist --print \"%(playlist_title|)s\t%(id)s\t%(title)s\" ";
+    cmd += ytDlpProxyArg();
+    cmd += L" ";
     cmd += quoteArg(parent.url);
 
     SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
@@ -1329,6 +1369,7 @@ void workerYtDlp(int id) {
     //   - `web_embedded`, `mweb`, `ios`, `android_creator` are added as
     //     fallbacks; yt-dlp merges formats from every client that responds.
     cmd += L" --extractor-args \"youtube:player_client=default,web_embedded,mweb,ios,android_creator;formats=missing_pot\"";
+    cmd += ytDlpProxyArg();
     // Prefer DASH over HLS. yt-dlp's default format ranker would otherwise
     // pick an HLS premium format (e.g. itag 616) that's served behind
     // SABR/signature gates; without a working JS solver every fragment 403s
@@ -2159,6 +2200,11 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
                     else if (sk == L"catDirArchive")   { readString(v, i, m.settings.catDirArchive); }
                     else if (sk == L"catDirProgram")   { readString(v, i, m.settings.catDirProgram); }
                     else if (sk == L"catDirDocument")  { readString(v, i, m.settings.catDirDocument); }
+                    else if (sk == L"proxyMode")    { double d=0; readNumber(v, i, d); m.settings.proxyMode = (int)d; }
+                    else if (sk == L"proxyServer")  { readString(v, i, m.settings.proxyServer); }
+                    else if (sk == L"proxyBypass")  { readString(v, i, m.settings.proxyBypass); }
+                    else if (sk == L"proxyUser")    { readString(v, i, m.settings.proxyUser); }
+                    else if (sk == L"proxyPass")    { readString(v, i, m.settings.proxyPass); }
                     else                              { skipValue(v, i); }
                     skipWs(v, i);
                     if (i < v.n && v.s[i] == L',') { ++i; continue; }
@@ -2251,10 +2297,27 @@ void handleMessage(const std::wstring& json) {
             g_settings.catDirArchive      = m.settings.catDirArchive;
             g_settings.catDirProgram      = m.settings.catDirProgram;
             g_settings.catDirDocument     = m.settings.catDirDocument;
+            // v0.9.8 Proxy.
+            g_settings.proxyMode    = m.settings.proxyMode;
+            g_settings.proxyServer  = m.settings.proxyServer;
+            g_settings.proxyBypass  = m.settings.proxyBypass;
+            g_settings.proxyUser    = m.settings.proxyUser;
+            g_settings.proxyPass    = m.settings.proxyPass;
             if (wasLaunchOnStartup != g_settings.launchOnStartup)
                 applyLaunchOnStartup(g_settings.launchOnStartup);
             if (wasClipboardWatch != g_settings.clipboardWatch)
                 applyClipboardWatch(g_settings.clipboardWatch);
+            // Push proxy state into the HTTP layer; HttpSession rebuilds
+            // its WinHTTP session on the next acquire.
+            {
+                ProxyConfig pc;
+                pc.mode   = g_settings.proxyMode;
+                pc.server = g_settings.proxyServer;
+                pc.bypass = g_settings.proxyBypass;
+                pc.user   = g_settings.proxyUser;
+                pc.pass   = g_settings.proxyPass;
+                setProxyConfig(pc);
+            }
             saveSettings();
             emitSettings();
             emitToast(L"Settings saved", L"ok");
@@ -2559,6 +2622,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
 
     OleInitialize(nullptr);
     loadSettings();
+
+    // Push the persisted proxy config into the HTTP layer before any
+    // request gets fired (update check, downloads).
+    {
+        ProxyConfig pc;
+        pc.mode   = g_settings.proxyMode;
+        pc.server = g_settings.proxyServer;
+        pc.bypass = g_settings.proxyBypass;
+        pc.user   = g_settings.proxyUser;
+        pc.pass   = g_settings.proxyPass;
+        setProxyConfig(pc);
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);

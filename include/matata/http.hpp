@@ -56,6 +56,24 @@ class HttpSession {
 public:
     static void*  acquire();
     static void   release();
+    // Drop the cached session so the next acquire() picks up changed
+    // ProxyConfig. Safe to call from any thread; the session is only
+    // closed when no requests are in flight (refcount == 0).
+    static void   resetForReconfig();
 };
+
+// Global proxy configuration. Read on every session-open and applied per
+// request. Mode 0 = system (WinHTTP automatic), 1 = none, 2 = manual.
+struct ProxyConfig {
+    int          mode = 0;
+    std::wstring server;     // "host:port"  (no scheme)  for HTTP proxy,
+                             // "socks=host:port"          for SOCKS5
+    std::wstring bypass;     // "*.local;<local>;..."
+    std::wstring user;
+    std::wstring pass;
+};
+
+void setProxyConfig(const ProxyConfig& cfg);
+ProxyConfig currentProxyConfig();
 
 }

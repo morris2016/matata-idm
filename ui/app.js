@@ -561,6 +561,12 @@ function fillSettings() {
   $("setCatDirArchive").value     = s.catDirArchive  || "";
   $("setCatDirProgram").value     = s.catDirProgram  || "";
   $("setCatDirDocument").value    = s.catDirDocument || "";
+  // Proxy.
+  $("setProxyMode").value         = String(s.proxyMode || 0);
+  $("setProxyServer").value       = s.proxyServer || "";
+  $("setProxyBypass").value       = s.proxyBypass || "";
+  $("setProxyUser").value         = s.proxyUser   || "";
+  $("setProxyPass").value         = s.proxyPass   || "";
   // Scheduler.
   $("setSchedEnabled").checked       = !!s.schedEnabled;
   $("setSchedStart").value           = minutesToHHMM(s.schedStartMinutes ?? 22*60);
@@ -738,6 +744,12 @@ document.addEventListener("DOMContentLoaded", () => {
       catDirArchive:     $("setCatDirArchive").value.trim(),
       catDirProgram:     $("setCatDirProgram").value.trim(),
       catDirDocument:    $("setCatDirDocument").value.trim(),
+      // Proxy.
+      proxyMode:     parseInt($("setProxyMode").value, 10) || 0,
+      proxyServer:   $("setProxyServer").value.trim(),
+      proxyBypass:   $("setProxyBypass").value.trim(),
+      proxyUser:     $("setProxyUser").value.trim(),
+      proxyPass:     $("setProxyPass").value,
       // Carry forward fields the modal doesn't edit so the host doesn't
       // overwrite them with defaults.
       queuePaused:   !!state.settings.queuePaused

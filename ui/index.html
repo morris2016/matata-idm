@@ -178,6 +178,34 @@
         <span></span>
       </div>
 
+      <h4 class="settings-section">Proxy</h4>
+      <p class="muted settings-help">
+        SOCKS5 mode is honoured by the YouTube/Vimeo (yt-dlp) path. Direct
+        HTTP downloads always use HTTP-proxy semantics, since WinHTTP does
+        not reliably support SOCKS5 across Windows versions.
+      </p>
+      <div class="settings-grid">
+        <label>Mode</label>
+        <select id="setProxyMode">
+          <option value="0">System (use Windows proxy)</option>
+          <option value="1">No proxy</option>
+          <option value="2">Manual HTTP proxy</option>
+          <option value="3">Manual SOCKS5 proxy (yt-dlp only)</option>
+        </select>
+
+        <label>Server <span class="muted">(host:port)</span></label>
+        <input type="text" id="setProxyServer" placeholder="proxy.example.com:8080">
+
+        <label>Bypass <span class="muted">(semicolon-separated; <code>&lt;local&gt;</code> for intranet)</span></label>
+        <input type="text" id="setProxyBypass" placeholder="*.local;<local>">
+
+        <label>Username <span class="muted">(optional)</span></label>
+        <input type="text" id="setProxyUser">
+
+        <label>Password <span class="muted">(optional)</span></label>
+        <input type="password" id="setProxyPass">
+      </div>
+
       <h4 class="settings-section">Scheduler</h4>
       <p class="muted settings-help">
         Run downloads only inside a time window. Outside the window, the queue
