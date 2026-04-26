@@ -13,7 +13,7 @@
 ;   - optionally adds a Start-Menu shortcut to matata-gui.exe
 
 #define MyAppName      "matata"
-#define MyAppVersion   "0.9.9.2"
+#define MyAppVersion   "0.9.9.3"
 #define MyAppPublisher "matata"
 #define MyAppURL       "https://matata.example/"
 #define MyAppExeName   "matata-gui.exe"
@@ -36,6 +36,12 @@ SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SetupIconFile=matata.ico
+; Detect a running matata-gui.exe / matata-host.exe and close them before
+; replacing files. Without this, an upgrade silently skips files-in-use
+; and the user keeps running the old build.
+CloseApplications=force
+CloseApplicationsFilter=*.exe,*.dll
+RestartApplications=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -50,10 +56,10 @@ Name: "registershell";     Description: "Add 'Download with matata' to the Explo
 Name: "registerscheme";    Description: "Register the matata: URL scheme"; GroupDescription: "Integration:"
 
 [Files]
-Source: "..\build\matata.exe";            DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\matata-gui.exe";        DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\matata-host.exe";       DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\matata_shell.dll";      DestDir: "{app}"; Flags: ignoreversion regserver; Tasks: registershell
+Source: "..\build\matata.exe";            DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "..\build\matata-gui.exe";        DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "..\build\matata-host.exe";       DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "..\build\matata_shell.dll";      DestDir: "{app}"; Flags: ignoreversion regserver restartreplace uninsrestartdelete; Tasks: registershell
 Source: "..\third-party\yt-dlp.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\third-party\ffmpeg.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\ui\index.html";               DestDir: "{app}\ui"; Flags: ignoreversion

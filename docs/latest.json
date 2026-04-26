@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.2",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.2/matata-0.9.9.2-setup.exe",
-  "notes": "- Production application icon: rounded-square gradient with download arrow + tray\n- Embedded in matata-gui.exe (16/24/32/48/64/128/256 sizes)\n- Used by Explorer, taskbar, Alt+Tab, system tray, installer setup wizard, and shortcuts"
+  "version": "0.9.9.3",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.3/matata-0.9.9.3-setup.exe",
+  "notes": "- Installer now force-closes a running matata before upgrading\n- Files mark restartreplace as a safety net so upgrades survive even if a process is stuck\n- Fixes the 0.9.9.2 issue where the in-app prompt kept firing after install\n  because the running matata-gui.exe held the binary locked"
 }
