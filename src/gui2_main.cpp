@@ -2632,7 +2632,9 @@ void handleMessage(const std::wstring& json) {
         SendMessageW(g_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
     }
     else if (m.type == L"win.close") {
-        DestroyWindow(g_hwnd);
+        // Hide to tray instead of exiting. The tray's "Exit" command is the
+        // only path that actually destroys the window.
+        ShowWindow(g_hwnd, SW_HIDE);
     }
 }
 
@@ -2796,6 +2798,13 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case WM_LBUTTONDBLCLK: showFromTray(); break;
             case WM_RBUTTONUP:     showTrayMenu(); break;
         }
+        return 0;
+    }
+    case WM_CLOSE: {
+        // Alt+F4 / SC_CLOSE / Windows shutdown all land here. Hide to tray
+        // instead of destroying. Tray "Exit" calls DestroyWindow directly
+        // and bypasses this -- that's the only path that quits matata.
+        ShowWindow(hwnd, SW_HIDE);
         return 0;
     }
     case WM_CLIPBOARDUPDATE: {

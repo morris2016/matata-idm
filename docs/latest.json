@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9/matata-0.9.9-setup.exe",
-  "notes": "- Sites Logins: per-host credential vault\n- Authorization: Basic header preempt-sent on every matching request\n- Subdomain match via leading dot (.example.com matches cdn.example.com)\n- Passwords DPAPI-encrypted at rest in HKCU\n- Caller-provided Authorization headers always win over the vault\n- Minimize-to-tray: window hides on minimize and lives in the system tray\n- Tray menu: Show / Pause all / Resume all / Exit"
+  "version": "0.9.9.1",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.1/matata-0.9.9.1-setup.exe",
+  "notes": "- Close button (X) and Alt+F4 now hide to tray instead of exiting\n- Tray menu's Exit is the only path that actually quits matata"
 }
