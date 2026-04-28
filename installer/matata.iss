@@ -13,7 +13,7 @@
 ;   - optionally adds a Start-Menu shortcut to matata-gui.exe
 
 #define MyAppName      "matata"
-#define MyAppVersion   "0.9.9.3"
+#define MyAppVersion   "0.9.9.4"
 #define MyAppPublisher "matata"
 #define MyAppURL       "https://matata.example/"
 #define MyAppExeName   "matata-gui.exe"
@@ -71,6 +71,8 @@ Source: "..\extension\popup.html";        DestDir: "{app}\extension"; Flags: ign
 Source: "..\extension\popup.js";          DestDir: "{app}\extension"; Flags: ignoreversion
 Source: "..\extension\confirm.html";      DestDir: "{app}\extension"; Flags: ignoreversion
 Source: "..\extension\confirm.js";        DestDir: "{app}\extension"; Flags: ignoreversion
+Source: "install-native-host.ps1";        DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "uninstall-native-host.ps1";      DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "..\README.md";                   DestDir: "{app}"; Flags: ignoreversion
 ; WebView2 runtime bootstrapper — only extracted at install time if the
 ; runtime is missing. Adds ~1.7 MB to the installer payload.
@@ -90,7 +92,22 @@ Root: HKCU; Subkey: "Software\Classes\matata\DefaultIcon"; ValueType: string; Va
 Root: HKCU; Subkey: "Software\Classes\matata\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: registerscheme
 
 [Run]
+; Repoint any existing native-messaging-host registration at the installed
+; matata-host.exe. Without this, an upgrade leaves the browser extension
+; talking to the dev-tree matata-host.exe -- which spawns a different
+; matata-gui.exe instance and fragments .mtpart state across installs.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\install-native-host.ps1"" -AppDir ""{app}"""; \
+  Flags: runhidden waituntilterminated; \
+  StatusMsg: "Registering matata native-messaging host..."
+
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\uninstall-native-host.ps1"""; \
+  RunOnceId: "MatataNativeHostCleanup"; \
+  Flags: runhidden
 
 [Code]
 { Returns true if the WebView2 evergreen runtime is already installed. The

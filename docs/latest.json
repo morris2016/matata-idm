@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.3",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.3/matata-0.9.9.3-setup.exe",
-  "notes": "- Installer now force-closes a running matata before upgrading\n- Files mark restartreplace as a safety net so upgrades survive even if a process is stuck\n- Fixes the 0.9.9.2 issue where the in-app prompt kept firing after install\n  because the running matata-gui.exe held the binary locked"
+  "version": "0.9.9.4",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.4/matata-0.9.9.4-setup.exe",
+  "notes": "- Installer now repoints the browser extension at the installed matata-host.exe\n- Fixes the case where the extension kept talking to a dev-tree matata-host.exe\n  spawning a separate matata-gui.exe instance whose state didn't persist\n- Preserves existing chromium / Firefox extension IDs across upgrades\n- Uninstall cleans up Chrome/Edge/Chromium/Brave/Firefox HKCU registrations"
 }
