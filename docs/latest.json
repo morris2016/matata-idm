@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.5",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.5/matata-0.9.9.5-setup.exe",
-  "notes": "- Bundles the AMO-signed Firefox extension (matata.xpi) inside the installer\n- New Settings -> Browser integration -> Install matata.xpi button: hands the\n  signed XPI to firefox.exe so Firefox shows its native install confirmation\n- Falls back to opening Explorer at the XPI if Firefox isn't found"
+  "version": "0.9.9.6",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.6/matata-0.9.9.6-setup.exe",
+  "notes": "- Removed the gray non-client strip above the custom titlebar (WM_NCCALCSIZE override)\n- Downloads list now persists across restarts at %LOCALAPPDATA%\\matata\\downloads.json\n- Items running or queued at quit time come back as Aborted so they can be resumed\n- Done items reappear with their final size and status"
 }

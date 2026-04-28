@@ -286,6 +286,11 @@ struct Settings {
 
 Settings g_settings;
 
+// Forward decl for the downloads-list persistence helpers; bodies live
+// after GuiItem + JsonView are defined.
+void saveItemsToDisk();
+void loadItemsFromDisk();
+
 // ---- Sites Logins persistence (DPAPI + REG_BINARY blob) -------------
 
 std::vector<unsigned char> dpapiProtect(const std::wstring& plaintext) {
@@ -2022,6 +2027,7 @@ int addDownloadEx(const HandoffSpec& spec) {
         }
         emitItem(*p);
     }
+    saveItemsToDisk();
     return id;
 }
 
@@ -2101,6 +2107,7 @@ void removeItem(int id) {
     }
     if (th && th->joinable()) th->detach();
     emitItemRemoved(id);
+    saveItemsToDisk();
 }
 
 void restartItem(int id) {
@@ -2250,6 +2257,7 @@ void onCompleted(CompleteMsg* m) {
     }
     // Promote the next queued item to Running, respecting maxJobs.
     dispatchQueued();
+    saveItemsToDisk();
 }
 
 // ---- bridge: handle JS → C++ messages -------------------------------
@@ -2460,6 +2468,143 @@ bool parseMessage(const std::wstring& json, ParsedMsg& m) {
         if (i < v.n && v.s[i] == L',') { ++i; continue; }
     }
     return true;
+}
+
+// ---- downloads-list persistence -------------------------------------
+
+std::wstring downloadsJsonPath() {
+    wchar_t buf[MAX_PATH];
+    if (SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf) != S_OK)
+        return L"";
+    std::wstring p = buf;
+    p += L"\\matata";
+    CreateDirectoryW(p.c_str(), nullptr);
+    p += L"\\downloads.json";
+    return p;
+}
+
+void saveItemsToDisk() {
+    std::wstring path = downloadsJsonPath();
+    if (path.empty()) return;
+    std::wstring json = L"{\"items\":[";
+    bool first = true;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMu);
+        for (auto& it : g_items) {
+            if (!first) json += L",";
+            first = false;
+            json += serializeItem(*it);
+        }
+    }
+    json += L"]}";
+    int n = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
+                                nullptr, 0, nullptr, nullptr);
+    std::string utf8(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
+                        utf8.data(), n, nullptr, nullptr);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+    CloseHandle(h);
+}
+
+void loadItemsFromDisk() {
+    std::wstring path = downloadsJsonPath();
+    if (path.empty()) return;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD size = GetFileSize(h, nullptr);
+    if (size == 0 || size > 16 * 1024 * 1024) { CloseHandle(h); return; }
+    std::string utf8(size, '\0');
+    DWORD got = 0;
+    ReadFile(h, utf8.data(), size, &got, nullptr);
+    CloseHandle(h);
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(),
+                                nullptr, 0);
+    std::wstring wjson(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(),
+                        wjson.data(), n);
+
+    JsonView v{ wjson.c_str(), wjson.size() };
+    size_t i = 0;
+    skipWs(v, i);
+    if (i >= v.n || v.s[i] != L'{') return;
+    ++i;
+    int maxId = 0;
+    while (true) {
+        skipWs(v, i);
+        if (i >= v.n) break;
+        if (v.s[i] == L'}') { ++i; break; }
+        std::wstring key;
+        if (!readString(v, i, key)) break;
+        skipWs(v, i);
+        if (i >= v.n || v.s[i] != L':') break;
+        ++i;
+        skipWs(v, i);
+        if (key != L"items" || i >= v.n || v.s[i] != L'[') {
+            skipValue(v, i);
+        } else {
+            ++i; // [
+            while (true) {
+                skipWs(v, i);
+                if (i >= v.n) break;
+                if (v.s[i] == L']') { ++i; break; }
+                if (v.s[i] != L'{') { skipValue(v, i); }
+                else {
+                    ++i;
+                    auto item = std::make_unique<GuiItem>();
+                    std::wstring stateStr;
+                    while (true) {
+                        skipWs(v, i);
+                        if (i >= v.n) break;
+                        if (v.s[i] == L'}') { ++i; break; }
+                        std::wstring fk;
+                        if (!readString(v, i, fk)) break;
+                        skipWs(v, i);
+                        if (i >= v.n || v.s[i] != L':') break;
+                        ++i;
+                        skipWs(v, i);
+                        if      (fk == L"id")           { double d=0; readNumber(v, i, d); item->id = (int)d; }
+                        else if (fk == L"url")          { readString(v, i, item->url); }
+                        else if (fk == L"filename")     { readString(v, i, item->filename); }
+                        else if (fk == L"outDir")       { readString(v, i, item->outDir); }
+                        else if (fk == L"resultPath")   { readString(v, i, item->resultPath); }
+                        else if (fk == L"message")      { readString(v, i, item->message); }
+                        else if (fk == L"state")        { readString(v, i, stateStr); }
+                        else if (fk == L"total")        { double d=0; readNumber(v, i, d); item->total = (int64_t)d; }
+                        else if (fk == L"downloaded")   { double d=0; readNumber(v, i, d); item->downloaded = (int64_t)d; }
+                        else if (fk == L"startedEpoch") { double d=0; readNumber(v, i, d); item->startedEpoch = (int64_t)d; }
+                        else if (fk == L"referer")      { std::wstring s; readString(v, i, s); if (!s.empty()) item->headers.push_back({L"Referer", s}); }
+                        else if (fk == L"userAgent")    { std::wstring s; readString(v, i, s); if (!s.empty()) item->headers.push_back({L"User-Agent", s}); }
+                        else                            { skipValue(v, i); }
+                        skipWs(v, i);
+                        if (i < v.n && v.s[i] == L',') { ++i; continue; }
+                    }
+                    // Map persisted state. Anything that was running or
+                    // queued at quit time has no live worker now -- mark
+                    // as Aborted so the user can resume manually. Done /
+                    // Err / Aborted persist as-is.
+                    if      (stateStr == L"done")    item->state = ItemState::Done;
+                    else if (stateStr == L"err")     item->state = ItemState::Err;
+                    else if (stateStr == L"aborted") item->state = ItemState::Aborted;
+                    else                              item->state = ItemState::Aborted;
+                    if (item->id > maxId) maxId = item->id;
+                    if (!item->url.empty()) {
+                        std::lock_guard<std::mutex> lk(g_itemsMu);
+                        g_items.push_back(std::move(item));
+                    }
+                }
+                skipWs(v, i);
+                if (i < v.n && v.s[i] == L',') { ++i; continue; }
+            }
+        }
+        skipWs(v, i);
+        if (i < v.n && v.s[i] == L',') { ++i; continue; }
+    }
+    if (maxId > 0) g_nextId.store(maxId + 1);
 }
 
 void handleMessage(const std::wstring& json) {
@@ -2821,6 +2966,29 @@ void initWebView2() {
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_NCCALCSIZE: {
+        // We dropped WS_OVERLAPPEDWINDOW for a borderless WS_POPUP look.
+        // WS_THICKFRAME (kept for OS resize edges + Aero snap) still draws
+        // a thin gray non-client border at the top by default. Returning
+        // 0 with rgrc[0] left unchanged tells Windows there is no NC area
+        // -- the entire window becomes client. When maximized, however,
+        // the OS overshoots the work area by the resize-frame thickness,
+        // so we manually subtract that inset to keep the maximized window
+        // flush with the screen edge.
+        if (wp == TRUE) {
+            if (IsZoomed(hwnd)) {
+                NCCALCSIZE_PARAMS* p = (NCCALCSIZE_PARAMS*)lp;
+                int frame = GetSystemMetrics(SM_CXSIZEFRAME) +
+                            GetSystemMetrics(SM_CXPADDEDBORDER);
+                p->rgrc[0].left   += frame;
+                p->rgrc[0].top    += frame;
+                p->rgrc[0].right  -= frame;
+                p->rgrc[0].bottom -= frame;
+            }
+            return 0;
+        }
+        break;
+    }
     case WM_SIZE: {
         if (g_controller) {
             RECT rc; GetClientRect(hwnd, &rc);
@@ -2894,6 +3062,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY: {
         saveSettings();
+        saveItemsToDisk();
         // Stop the scheduler tick before the rest of teardown.
         g_schedExitFlag.store(true);
         if (g_clipboardSubscribed) {
@@ -2952,6 +3121,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
 
     OleInitialize(nullptr);
     loadSettings();
+    // Restore the downloads list from %LOCALAPPDATA%\matata\downloads.json
+    // (items running/queued at last quit come back as Aborted so the user
+    // can manually resume; Done items show up complete).
+    loadItemsFromDisk();
 
     // Push the persisted proxy config + sites logins into the HTTP layer
     // before any request gets fired (update check, downloads).
