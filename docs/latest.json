@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.6",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.6/matata-0.9.9.6-setup.exe",
-  "notes": "- Removed the gray non-client strip above the custom titlebar (WM_NCCALCSIZE override)\n- Downloads list now persists across restarts at %LOCALAPPDATA%\\matata\\downloads.json\n- Items running or queued at quit time come back as Aborted so they can be resumed\n- Done items reappear with their final size and status"
+  "version": "0.9.9.7",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.7/matata-0.9.9.7-setup.exe",
+  "notes": "- Fresh installs auto-launch Firefox with the bundled signed XPI on first run\n  so the install confirmation dialog appears without hunting for the button\n- Idempotent: gated by HKCU firstRunCompleted; never re-fires on later launches\n- Silent if Firefox isn't installed; the Settings button stays available"
 }
