@@ -753,13 +753,68 @@ void emitSettings() {
 
 // ---- background update check ----------------------------------------
 
+// State for the auto-update download. Set by updateCheckWorker once the
+// installer is on disk; consumed by WM_DESTROY (auto-install on quit) and
+// the tray menu's "Install update" entry.
+std::mutex   g_pendingUpdateMu;
+std::wstring g_pendingUpdateInstaller;
+std::wstring g_pendingUpdateVersion;
+
 // Heap-allocated payload posted from the worker thread to the UI thread
 // on WM_APP_UPDATE_AVAIL. The handler owns it and frees with delete.
 struct UpdateAvailMsg {
     std::wstring latestVersion;
     std::wstring downloadUrl;
     std::wstring notes;
+    bool         downloaded   = false; // true => installer already on disk
+    std::wstring installerPath;        // valid only when downloaded=true
 };
+
+// Stream the installer .exe to a temp file via httpGetRange. Returns true
+// and writes the path to outPath on success. WinHTTP follows redirects
+// automatically, so the github.com -> objects.githubusercontent.com hop
+// is transparent.
+bool downloadInstaller(const std::wstring& url, std::wstring& outPath,
+                       std::wstring& err) {
+    Url u;
+    if (!parseUrl(url, u, err)) return false;
+    if (u.scheme != L"https" && u.scheme != L"http") {
+        err = L"installer URL must be http(s)";
+        return false;
+    }
+    wchar_t tempDir[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempDir) == 0) {
+        err = L"GetTempPath failed";
+        return false;
+    }
+    std::wstring filename = u.inferredFilename();
+    if (filename.empty() ||
+        filename.find(L".exe") == std::wstring::npos) {
+        filename = L"matata-update-setup.exe";
+    }
+    std::wstring path = std::wstring(tempDir) + filename;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        err = L"create temp file failed";
+        return false;
+    }
+    ExtraHeaders hdrs;
+    RangeRequest rr;     // start=0, end=-1 -> full body
+    int status = httpGetRange(u, rr, hdrs, nullptr,
+        [&](const uint8_t* data, size_t len) -> bool {
+            DWORD wrote = 0;
+            return WriteFile(h, data, (DWORD)len, &wrote, nullptr) != 0;
+        }, err);
+    CloseHandle(h);
+    if (status < 200 || status >= 300) {
+        DeleteFileW(path.c_str());
+        if (err.empty()) err = L"HTTP " + std::to_wstring(status);
+        return false;
+    }
+    outPath = path;
+    return true;
+}
 
 void updateCheckWorker() {
     UpdateInfo info;
@@ -773,29 +828,83 @@ void updateCheckWorker() {
                kMatataVersion, info.latestVersion.c_str());
         return;
     }
+    dbgLog(L"updateCheck: %ls available, downloading from %ls",
+           info.latestVersion.c_str(), info.downloadUrl.c_str());
+
     auto* msg = new UpdateAvailMsg{
-        std::move(info.latestVersion),
-        std::move(info.downloadUrl),
-        std::move(info.notes),
+        info.latestVersion,
+        info.downloadUrl,
+        info.notes,
+        false,
+        L""
     };
+
+    // Try to silently fetch the installer in the background. If it
+    // succeeds, the WM_APP_UPDATE_AVAIL handler shows a low-key toast
+    // and the installer fires automatically when the user quits matata.
+    // If the download fails (network blip, blocked, etc.) we fall through
+    // to the legacy MessageBox prompt with a "browser-download" link.
+    std::wstring installerPath, dlErr;
+    if (!info.downloadUrl.empty() &&
+        downloadInstaller(info.downloadUrl, installerPath, dlErr)) {
+        msg->downloaded = true;
+        msg->installerPath = installerPath;
+        {
+            std::lock_guard<std::mutex> lk(g_pendingUpdateMu);
+            g_pendingUpdateInstaller = installerPath;
+            g_pendingUpdateVersion   = info.latestVersion;
+        }
+        dbgLog(L"updateCheck: installer downloaded -> %ls",
+               installerPath.c_str());
+    } else if (!dlErr.empty()) {
+        dbgLog(L"updateCheck: download failed (%ls); falling back to prompt",
+               dlErr.c_str());
+    }
+
     if (!g_hwnd ||
         !PostMessageW(g_hwnd, WM_APP_UPDATE_AVAIL, 0, (LPARAM)msg)) {
         delete msg;
     }
 }
 
+// Run the downloaded installer. /VERYSILENT runs without UI; CloseApplications
+// terminates the running matata so files can be replaced; RestartApplications
+// brings matata back up after the swap.
+void runPendingInstaller() {
+    std::wstring path, ver;
+    {
+        std::lock_guard<std::mutex> lk(g_pendingUpdateMu);
+        path = g_pendingUpdateInstaller;
+        ver  = g_pendingUpdateVersion;
+    }
+    if (path.empty()) return;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    std::wstring args =
+        L"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS";
+    dbgLog(L"runPendingInstaller: launching %ls (v%ls)",
+           path.c_str(), ver.c_str());
+    ShellExecuteW(nullptr, L"open", path.c_str(), args.c_str(),
+                  nullptr, SW_HIDE);
+}
+
 void onUpdateAvailable(UpdateAvailMsg* m) {
     std::unique_ptr<UpdateAvailMsg> g(m);
-    // Render an IDM-style "new version available" prompt. MessageBox is
-    // intentionally minimal; the goal is parity with IDM's Update / Cancel
-    // dialog without growing a custom-dialog footprint.
+    if (m->downloaded) {
+        // Auto-update happy path: installer on disk, will run on next quit.
+        // Just give the user a non-blocking heads-up.
+        emitToast(L"matata " + m->latestVersion +
+                  L" downloaded -- installs automatically on quit.",
+                  L"info");
+        return;
+    }
+    // Fallback: download failed, prompt the user to grab it via the browser.
     std::wstring text = L"matata " + m->latestVersion + L" is available.\n\n";
     text += L"You're running matata " + std::wstring(kMatataVersion) + L".";
     if (!m->notes.empty()) {
         text += L"\n\nWhat's new:\n";
         text += m->notes;
     }
-    text += L"\n\nUpdate now?";
+    text += L"\n\nDownload it manually now?";
     int r = MessageBoxW(g_hwnd, text.c_str(),
                         L"matata - Update available",
                         MB_YESNO | MB_ICONINFORMATION);
@@ -1137,12 +1246,23 @@ void showFromTray() {
 }
 
 void showTrayMenu() {
+    std::wstring pendingVersion;
+    {
+        std::lock_guard<std::mutex> lk(g_pendingUpdateMu);
+        if (!g_pendingUpdateInstaller.empty())
+            pendingVersion = g_pendingUpdateVersion;
+    }
     POINT pt; GetCursorPos(&pt);
     HMENU hm = CreatePopupMenu();
     AppendMenuW(hm, MF_STRING, 1, L"Show matata");
     AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hm, MF_STRING, 2, L"Pause all");
     AppendMenuW(hm, MF_STRING, 3, L"Resume all");
+    if (!pendingVersion.empty()) {
+        AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+        std::wstring lbl = L"Install update " + pendingVersion + L" now";
+        AppendMenuW(hm, MF_STRING, 5, lbl.c_str());
+    }
     AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hm, MF_STRING, 4, L"Exit");
     // Required so the menu auto-dismisses when the user clicks elsewhere.
@@ -1174,6 +1294,11 @@ void showTrayMenu() {
             break;
         }
         case 4: DestroyWindow(g_hwnd); break;
+        case 5:
+            // Fire the installer; /CLOSEAPPLICATIONS will terminate matata
+            // mid-install, /RESTARTAPPLICATIONS brings it back up after.
+            runPendingInstaller();
+            break;
     }
 }
 
@@ -3077,6 +3202,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY: {
         saveSettings();
         saveItemsToDisk();
+        // If an update was downloaded in the background, run it before we
+        // exit. Inno's /CLOSEAPPLICATIONS waits for the host to die anyway,
+        // and /RESTARTAPPLICATIONS brings matata back up post-swap.
+        runPendingInstaller();
         // Stop the scheduler tick before the rest of teardown.
         g_schedExitFlag.store(true);
         if (g_clipboardSubscribed) {

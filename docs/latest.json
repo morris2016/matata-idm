@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.7",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.7/matata-0.9.9.7-setup.exe",
-  "notes": "- Fresh installs auto-launch Firefox with the bundled signed XPI on first run\n  so the install confirmation dialog appears without hunting for the button\n- Idempotent: gated by HKCU firstRunCompleted; never re-fires on later launches\n- Silent if Firefox isn't installed; the Settings button stays available"
+  "version": "0.9.9.8",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.8/matata-0.9.9.8-setup.exe",
+  "notes": "- Auto-update: matata now silently downloads new installers in the background\n- Toast on completion: 'matata X.Y.Z downloaded -- installs automatically on quit'\n- Tray menu adds 'Install update X.Y.Z now' while an update is staged\n- WM_DESTROY runs the staged installer with /VERYSILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS\n- Falls back to the legacy browser-download MessageBox if the silent fetch fails"
 }
