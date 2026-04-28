@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.8",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.8/matata-0.9.9.8-setup.exe",
-  "notes": "- Auto-update: matata now silently downloads new installers in the background\n- Toast on completion: 'matata X.Y.Z downloaded -- installs automatically on quit'\n- Tray menu adds 'Install update X.Y.Z now' while an update is staged\n- WM_DESTROY runs the staged installer with /VERYSILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS\n- Falls back to the legacy browser-download MessageBox if the silent fetch fails"
+  "version": "0.9.9.9",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.9/matata-0.9.9.9-setup.exe",
+  "notes": "- Hardened single-instance enforcement: relaunching matata never spawns a second matata-gui.exe\n- Hidden tray instance is now reliably brought to the foreground via TOPMOST flicker\n- Race-resilient: second instance retries the FindWindow lookup for up to 2s if the first is still initializing"
 }

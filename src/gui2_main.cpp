@@ -216,6 +216,19 @@ bool parseHandoffArgs(PWSTR cmdLine, HandoffSpec& out) {
     return !out.url.empty();
 }
 
+// Reliably bring an existing window to the foreground even when it's
+// hidden in the tray (SW_HIDE). The TOPMOST/NOTOPMOST flicker bypasses
+// SetForegroundWindow's focus-stealing protection without leaving the
+// window pinned above everything.
+void bringWindowToFront(HWND hwnd) {
+    if (!hwnd) return;
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+    ShowWindow(hwnd, SW_SHOW);
+    SetWindowPos(hwnd, HWND_TOPMOST,    0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetWindowPos(hwnd, HWND_NOTOPMOST,  0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(hwnd);
+}
+
 bool forwardHandoffToExistingInstance(const HandoffSpec& spec) {
     HWND target = FindWindowW(kClassName, nullptr);
     if (!target) return false;
@@ -224,9 +237,7 @@ bool forwardHandoffToExistingInstance(const HandoffSpec& spec) {
     cds.dwData = kHandoffMagic;
     cds.cbData = (DWORD)(blob.size() * sizeof(wchar_t));
     cds.lpData = (PVOID)blob.data();
-    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-    ShowWindow(target, SW_SHOW);
-    SetForegroundWindow(target);
+    bringWindowToFront(target);
     DWORD_PTR result = 0;
     SendMessageTimeoutW(target, WM_COPYDATA, 0, (LPARAM)&cds,
                         SMTO_ABORTIFHUNG, 5000, &result);
@@ -3245,18 +3256,35 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int /*nCmdShow*/)
     dbgLog(L"parsed haveCli=%d url=[%ls] filename=[%ls]",
            (int)haveCli, cliSpec.url.c_str(), cliSpec.filename.c_str());
 
+    // Single-instance enforcement. Two layers:
+    //   1. FindWindowW first -- if a matata window already exists in this
+    //      session, just hand off to it and exit. Catches the common case
+    //      of relaunching while matata sits hidden in the tray.
+    //   2. Named-mutex check as a backstop for the brief window between
+    //      exe launch and CreateWindowExW. If we lose the mutex race but
+    //      the winner hasn't shown its window yet, retry briefly.
+    {
+        HWND existing = FindWindowW(kClassName, nullptr);
+        if (existing) {
+            if (haveCli) forwardHandoffToExistingInstance(cliSpec);
+            else         bringWindowToFront(existing);
+            return 0;
+        }
+    }
+
     g_instanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutex);
     bool already = (GetLastError() == ERROR_ALREADY_EXISTS);
     if (already) {
-        if (haveCli) {
-            forwardHandoffToExistingInstance(cliSpec);
-        } else {
-            HWND target = FindWindowW(kClassName, nullptr);
-            if (target) {
-                if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-                else                  ShowWindow(target, SW_SHOW);
-                SetForegroundWindow(target);
-            }
+        // Wait up to 2 seconds for the winner's window to appear, then
+        // forward / raise as in the FindWindowW fast path above.
+        HWND target = nullptr;
+        for (int i = 0; i < 20 && !target; ++i) {
+            Sleep(100);
+            target = FindWindowW(kClassName, nullptr);
+        }
+        if (target) {
+            if (haveCli) forwardHandoffToExistingInstance(cliSpec);
+            else         bringWindowToFront(target);
         }
         if (g_instanceMutex) CloseHandle(g_instanceMutex);
         return 0;

@@ -13,7 +13,7 @@
 ;   - optionally adds a Start-Menu shortcut to matata-gui.exe
 
 #define MyAppName      "matata"
-#define MyAppVersion   "0.9.9.8"
+#define MyAppVersion   "0.9.9.9"
 #define MyAppPublisher "matata"
 #define MyAppURL       "https://matata.example/"
 #define MyAppExeName   "matata-gui.exe"
