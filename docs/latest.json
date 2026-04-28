@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.4",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.4/matata-0.9.9.4-setup.exe",
-  "notes": "- Installer now repoints the browser extension at the installed matata-host.exe\n- Fixes the case where the extension kept talking to a dev-tree matata-host.exe\n  spawning a separate matata-gui.exe instance whose state didn't persist\n- Preserves existing chromium / Firefox extension IDs across upgrades\n- Uninstall cleans up Chrome/Edge/Chromium/Brave/Firefox HKCU registrations"
+  "version": "0.9.9.5",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.5/matata-0.9.9.5-setup.exe",
+  "notes": "- Bundles the AMO-signed Firefox extension (matata.xpi) inside the installer\n- New Settings -> Browser integration -> Install matata.xpi button: hands the\n  signed XPI to firefox.exe so Firefox shows its native install confirmation\n- Falls back to opening Explorer at the XPI if Firefox isn't found"
 }

@@ -13,7 +13,7 @@
 ;   - optionally adds a Start-Menu shortcut to matata-gui.exe
 
 #define MyAppName      "matata"
-#define MyAppVersion   "0.9.9.4"
+#define MyAppVersion   "0.9.9.5"
 #define MyAppPublisher "matata"
 #define MyAppURL       "https://matata.example/"
 #define MyAppExeName   "matata-gui.exe"
@@ -71,6 +71,10 @@ Source: "..\extension\popup.html";        DestDir: "{app}\extension"; Flags: ign
 Source: "..\extension\popup.js";          DestDir: "{app}\extension"; Flags: ignoreversion
 Source: "..\extension\confirm.html";      DestDir: "{app}\extension"; Flags: ignoreversion
 Source: "..\extension\confirm.js";        DestDir: "{app}\extension"; Flags: ignoreversion
+; AMO-signed Firefox XPI -- shipped so the "Install Firefox extension" button
+; in matata Settings can hand it to firefox.exe directly. Optional: a missing
+; file silently disables the button at runtime.
+Source: "..\extension\matata.xpi";        DestDir: "{app}\extension"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "install-native-host.ps1";        DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "uninstall-native-host.ps1";      DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "..\README.md";                   DestDir: "{app}"; Flags: ignoreversion

@@ -783,6 +783,11 @@ document.addEventListener("DOMContentLoaded", () => {
   // Sites Logins: Add button.
   $("btnSiteLoginAdd").addEventListener("click", () => addSiteLoginRow());
 
+  // Browser integration: hand the bundled signed XPI to firefox.exe.
+  $("btnInstallFirefoxExt").addEventListener("click", () => {
+    send({type: "installFirefoxExt"});
+  });
+
   // Settings save
   $("btnSettingsSave").addEventListener("click", () => {
     const s = {

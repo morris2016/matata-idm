@@ -34,7 +34,12 @@ if (-not (Test-Path $hostDir)) {
 }
 $hostJsonChrome  = Join-Path $hostDir 'com.matata.host.json'
 $hostJsonFirefox = Join-Path $hostDir 'com.matata.host.firefox.json'
-$ffExtId = 'matata@matata.local'
+# Firefox gecko IDs we always allow:
+#   matata-self@matata.local -- self-distributed XPI (signed via AMO unlisted)
+#   matata@matata.local      -- listed AMO submission (legacy / future)
+# Both IDs share one matata-host.exe; whichever entry the user installs from
+# will work without re-registering anything.
+$ffDefaultIds = @('matata-self@matata.local', 'matata@matata.local')
 
 function Get-RegisteredJsonPath {
     param([string]$Key)
@@ -59,7 +64,7 @@ foreach ($b in $browsers) {
 $chromeAllowed = @($chromeAllowed | Sort-Object -Unique)
 
 # Preserve Firefox allowed_extensions; ensure the gecko id is always present.
-$ffAllowed = @($ffExtId)
+$ffAllowed = @($ffDefaultIds)
 $ffPrev = Get-RegisteredJsonPath -Key 'HKCU:\Software\Mozilla\NativeMessagingHosts\com.matata.host'
 if ($ffPrev) {
     try {

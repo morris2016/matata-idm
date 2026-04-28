@@ -16,7 +16,12 @@ set ROOT=%~dp0
 set HOST_EXE=%ROOT%build\matata-host.exe
 set HOST_JSON=%ROOT%native-host\com.matata.host.json
 set HOST_JSON_FF=%ROOT%native-host\com.matata.host.firefox.json
-set FF_EXT_ID=matata@matata.local
+rem Two Firefox gecko IDs:
+rem   matata-self@matata.local -- self-distributed XPI (AMO unlisted signing)
+rem   matata@matata.local      -- listed AMO submission
+rem We whitelist both so the same matata-host.exe accepts messages from either.
+set FF_EXT_ID=matata-self@matata.local
+set FF_EXT_ID_ALT=matata@matata.local
 
 set CHROME_ID=%1
 set EDGE_ID=%2
@@ -84,7 +89,8 @@ rem --- Firefox manifest (allowed_extensions) ---
     echo   "path": "%ESCAPED_PATH%",
     echo   "type": "stdio",
     echo   "allowed_extensions": [
-    echo     "%FF_EXT_ID%"
+    echo     "%FF_EXT_ID%",
+    echo     "%FF_EXT_ID_ALT%"
     echo   ]
     echo }
 )

@@ -2632,6 +2632,64 @@ void handleMessage(const std::wstring& json) {
         if (IsZoomed(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
         else                  ShowWindow(g_hwnd, SW_MAXIMIZE);
     }
+    else if (m.type == L"installFirefoxExt") {
+        // Hand the signed AMO XPI to firefox.exe so Firefox shows its
+        // standard install confirmation. We try a few well-known places
+        // for firefox.exe; if none match, we open the containing folder
+        // so the user can drag it into Firefox manually.
+        std::wstring xpi = exeDirEarly() + L"\\extension\\matata.xpi";
+        if (GetFileAttributesW(xpi.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            emitToast(L"matata.xpi not found next to matata-gui.exe", L"err");
+        } else {
+            auto regPath = [](HKEY root, const wchar_t* sub, const wchar_t* val,
+                              std::wstring& out) -> bool {
+                HKEY hk;
+                if (RegOpenKeyExW(root, sub, 0, KEY_READ | KEY_WOW64_64KEY, &hk) != ERROR_SUCCESS &&
+                    RegOpenKeyExW(root, sub, 0, KEY_READ | KEY_WOW64_32KEY, &hk) != ERROR_SUCCESS)
+                    return false;
+                wchar_t buf[MAX_PATH]; DWORD cb = sizeof(buf); DWORD type = 0;
+                LONG r = RegQueryValueExW(hk, val, nullptr, &type, (BYTE*)buf, &cb);
+                RegCloseKey(hk);
+                if (r != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return false;
+                out.assign(buf, cb / sizeof(wchar_t));
+                while (!out.empty() && out.back() == L'\0') out.pop_back();
+                return true;
+            };
+            std::wstring firefox;
+            // Modern Firefox writes its install path here; try HKLM then HKCU.
+            std::wstring ver;
+            if (regPath(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Mozilla\\Mozilla Firefox", L"CurrentVersion", ver) ||
+                regPath(HKEY_CURRENT_USER,  L"Software\\Mozilla\\Mozilla Firefox", L"CurrentVersion", ver)) {
+                std::wstring sub = L"SOFTWARE\\Mozilla\\Mozilla Firefox\\" + ver + L"\\Main";
+                if (!regPath(HKEY_LOCAL_MACHINE, sub.c_str(), L"PathToExe", firefox))
+                    regPath(HKEY_CURRENT_USER, sub.c_str(), L"PathToExe", firefox);
+            }
+            // Fallbacks: well-known absolute paths.
+            if (firefox.empty() || GetFileAttributesW(firefox.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                const wchar_t* candidates[] = {
+                    L"C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+                    L"C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
+                };
+                firefox.clear();
+                for (auto* c : candidates) {
+                    if (GetFileAttributesW(c) != INVALID_FILE_ATTRIBUTES) { firefox = c; break; }
+                }
+            }
+            if (firefox.empty()) {
+                // Couldn't find Firefox -- open the folder so the user can
+                // drag matata.xpi into a running Firefox window.
+                std::wstring args = L"/select,\"" + xpi + L"\"";
+                ShellExecuteW(g_hwnd, L"open", L"explorer.exe",
+                              args.c_str(), nullptr, SW_SHOWNORMAL);
+                emitToast(L"Firefox not found. Drag matata.xpi from the opened folder into Firefox.", L"info");
+            } else {
+                std::wstring quoted = L"\"" + xpi + L"\"";
+                ShellExecuteW(g_hwnd, L"open", firefox.c_str(),
+                              quoted.c_str(), nullptr, SW_SHOWNORMAL);
+                emitToast(L"Opening Firefox to install matata extension", L"info");
+            }
+        }
+    }
     else if (m.type == L"win.beginDrag") {
         // The OS title bar is gone (WS_POPUP), so the user drags the window
         // by mousedown'ing the .titlebar-drag div in the WebView. Hand off
