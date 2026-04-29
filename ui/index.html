@@ -31,6 +31,24 @@
   </div>
 </header>
 
+<!-- Update banner (recorda-style): downloads progress at the top of the
+     window, then transitions to a "Install now / Later" prompt when the
+     installer is fully on disk. -->
+<div id="updateBanner" class="update-banner" hidden>
+  <div class="ub-icon">
+    <svg viewBox="0 0 16 16"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+  </div>
+  <div class="ub-body">
+    <div class="ub-title" id="ubTitle"></div>
+    <div class="ub-progress-wrap"><div class="ub-progress-bar" id="ubProgressBar"></div></div>
+    <div class="ub-meta" id="ubMeta"></div>
+  </div>
+  <div class="ub-actions" id="ubActions" hidden>
+    <button class="btn-primary"   id="ubInstallNow"   type="button">Install now</button>
+    <button class="btn-secondary" id="ubInstallLater" type="button">Later</button>
+  </div>
+</div>
+
 <main class="layout">
   <aside class="sidebar">
     <div class="add-split">

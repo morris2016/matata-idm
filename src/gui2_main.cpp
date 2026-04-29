@@ -768,6 +768,30 @@ void emitSettings() {
     postEvent(std::move(ev));
 }
 
+// In-app update banner events. updateProgress fires repeatedly while the
+// installer streams down; updateReady fires once when the file is fully
+// on disk. The UI banner uses these to render a recorda-style progress
+// strip and then the "Install now / Later" prompt.
+void emitUpdateProgress(const std::wstring& version, int64_t bytes, int64_t total) {
+    wchar_t buf[64];
+    std::wstring ev = L"{\"type\":\"updateProgress\",\"version\":";
+    ev += quoteJson(version);
+    _snwprintf_s(buf, _TRUNCATE, L",\"bytes\":%lld",  (long long)bytes);  ev += buf;
+    _snwprintf_s(buf, _TRUNCATE, L",\"total\":%lld}", (long long)total);  ev += buf;
+    postEvent(std::move(ev));
+}
+
+void emitUpdateReady(const std::wstring& version) {
+    std::wstring ev = L"{\"type\":\"updateReady\",\"version\":";
+    ev += quoteJson(version);
+    ev += L"}";
+    postEvent(std::move(ev));
+}
+
+void emitUpdateDismissed() {
+    postEvent(L"{\"type\":\"updateDismissed\"}");
+}
+
 // ---- background update check ----------------------------------------
 
 // State for the auto-update download. Set by updateCheckWorker once the
@@ -790,9 +814,10 @@ struct UpdateAvailMsg {
 // Stream the installer .exe to a temp file via httpGetRange. Returns true
 // and writes the path to outPath on success. WinHTTP follows redirects
 // automatically, so the github.com -> objects.githubusercontent.com hop
-// is transparent.
-bool downloadInstaller(const std::wstring& url, std::wstring& outPath,
-                       std::wstring& err) {
+// is transparent. Emits updateProgress events to the UI throughout so
+// the in-app banner can show download progress.
+bool downloadInstaller(const std::wstring& url, const std::wstring& version,
+                       std::wstring& outPath, std::wstring& err) {
     Url u;
     if (!parseUrl(url, u, err)) return false;
     if (u.scheme != L"https" && u.scheme != L"http") {
@@ -810,23 +835,48 @@ bool downloadInstaller(const std::wstring& url, std::wstring& outPath,
         filename = L"matata-update-setup.exe";
     }
     std::wstring path = std::wstring(tempDir) + filename;
+
+    // Probe first so the banner has a sensible total to render against.
+    // Probe failure is non-fatal; we just won't be able to compute a %.
+    ExtraHeaders hdrs;
+    ResourceInfo info;
+    std::wstring probeErr;
+    int64_t totalSize = -1;
+    if (probeResource(u, hdrs, info, probeErr) && info.totalSize > 0) {
+        totalSize = info.totalSize;
+    }
+    emitUpdateProgress(version, 0, totalSize);
+
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         err = L"create temp file failed";
         return false;
     }
-    ExtraHeaders hdrs;
+
+    int64_t received = 0;
+    auto    lastTick = std::chrono::steady_clock::now();
     RangeRequest rr;     // start=0, end=-1 -> full body
     int status = httpGetRange(u, rr, hdrs, nullptr,
         [&](const uint8_t* data, size_t len) -> bool {
             DWORD wrote = 0;
-            return WriteFile(h, data, (DWORD)len, &wrote, nullptr) != 0;
+            if (!WriteFile(h, data, (DWORD)len, &wrote, nullptr)) return false;
+            received += (int64_t)len;
+            // Throttle progress events to ~5/sec so the bridge isn't spammed.
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastTick > std::chrono::milliseconds(200)) {
+                lastTick = now;
+                emitUpdateProgress(version, received, totalSize);
+            }
+            return true;
         }, err);
     CloseHandle(h);
+    // Final progress emit: completes the bar at 100%.
+    emitUpdateProgress(version, received, totalSize > 0 ? totalSize : received);
     if (status < 200 || status >= 300) {
         DeleteFileW(path.c_str());
         if (err.empty()) err = L"HTTP " + std::to_wstring(status);
+        emitUpdateDismissed();
         return false;
     }
     outPath = path;
@@ -863,7 +913,8 @@ void updateCheckWorker() {
     // to the legacy MessageBox prompt with a "browser-download" link.
     std::wstring installerPath, dlErr;
     if (!info.downloadUrl.empty() &&
-        downloadInstaller(info.downloadUrl, installerPath, dlErr)) {
+        downloadInstaller(info.downloadUrl, info.latestVersion,
+                          installerPath, dlErr)) {
         msg->downloaded = true;
         msg->installerPath = installerPath;
         {
@@ -907,11 +958,10 @@ void runPendingInstaller() {
 void onUpdateAvailable(UpdateAvailMsg* m) {
     std::unique_ptr<UpdateAvailMsg> g(m);
     if (m->downloaded) {
-        // Auto-update happy path: installer on disk, will run on next quit.
-        // Just give the user a non-blocking heads-up.
-        emitToast(L"matata " + m->latestVersion +
-                  L" downloaded -- installs automatically on quit.",
-                  L"info");
+        // Auto-update happy path: installer on disk. The UI banner will
+        // show "Install now / Later" so the user explicitly chooses.
+        // Falls back to running on quit (WM_DESTROY) if they ignore it.
+        emitUpdateReady(m->latestVersion);
         return;
     }
     // Fallback: download failed, prompt the user to grab it via the browser.
@@ -1082,47 +1132,8 @@ void schedulerWorker() {
                                        g_settings.schedStartMinutes,
                                        g_settings.schedStopMinutes);
     }
-    int firstUpdateGraceTicks = 2;   // ~60s grace after launch before we
-                                     // consider firing a staged update.
     while (!g_schedExitFlag.load()) {
         schedTick(wasIn);
-
-        // Proactive auto-install: if the background updater staged an
-        // installer and matata is idle (no Running / Queued items) AND
-        // we're past the initial grace, fire it. The installer's
-        // /CLOSEAPPLICATIONS will close matata; /RESTARTAPPLICATIONS
-        // brings it back at the new version.
-        if (firstUpdateGraceTicks > 0) {
-            --firstUpdateGraceTicks;
-        } else {
-            bool havePending = false;
-            {
-                std::lock_guard<std::mutex> lk(g_pendingUpdateMu);
-                havePending = !g_pendingUpdateInstaller.empty();
-            }
-            if (havePending) {
-                bool busy = false;
-                {
-                    std::lock_guard<std::mutex> lk(g_itemsMu);
-                    for (auto& it : g_items) {
-                        if (it->state == ItemState::Running ||
-                            it->state == ItemState::Queued) {
-                            busy = true; break;
-                        }
-                    }
-                }
-                if (!busy) {
-                    dbgLog(L"scheduler: idle + pending update -> auto-install now");
-                    runPendingInstaller();
-                    // runPendingInstaller is fire-and-forget; Inno will
-                    // /CLOSEAPPLICATIONS us within seconds. Either we
-                    // get killed or the install fails -- in the latter
-                    // case keep the file staged so a manual quit still
-                    // tries again.
-                }
-            }
-        }
-
         // Sleep in 1s slices so app shutdown isn't held up by the tick rate.
         for (int i = 0; i < 30 && !g_schedExitFlag.load(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -3025,6 +3036,16 @@ void handleMessage(const std::wstring& json) {
     else if (m.type == L"installFirefoxExt") {
         // user-triggered: explicit feedback, fall back to opening Explorer.
         installFirefoxXpi(/*verbose*/ true);
+    }
+    else if (m.type == L"installPendingUpdate") {
+        // User clicked "Install now" on the update banner. Fire the staged
+        // installer immediately; Inno's /CLOSEAPPLICATIONS will close
+        // matata mid-install, /RESTARTAPPLICATIONS brings it back.
+        runPendingInstaller();
+    }
+    else if (m.type == L"dismissUpdate") {
+        // "Later" -- hide the banner client-side. The installer stays
+        // staged and will fire on the next real quit (WM_DESTROY).
     }
     else if (m.type == L"win.beginDrag") {
         // The OS title bar is gone (WS_POPUP), so the user drags the window

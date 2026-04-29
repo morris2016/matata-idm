@@ -24,6 +24,6 @@ bool checkForUpdate(const std::wstring& manifestUrl,
                     UpdateInfo& info, std::wstring& err);
 
 // Current matata version baked in at compile time.
-constexpr const wchar_t* kMatataVersion = L"0.9.9.10";
+constexpr const wchar_t* kMatataVersion = L"0.9.9.11";
 
 }

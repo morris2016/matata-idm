@@ -27,13 +27,16 @@ window.matata = {
   onEvent(ev) {
     try {
       switch (ev.type) {
-        case "items":      onItems(ev.list); break;
-        case "item":       onItem(ev.item); break;
-        case "remove":     onRemove(ev.id); break;
-        case "settings":   onSettings(ev.settings); break;
-        case "toast":      toast(ev.message, ev.kind || "info"); break;
-        case "openAdd":    openModal("addModal"); break;
-        case "windowState": onWindowState(ev); break;
+        case "items":           onItems(ev.list); break;
+        case "item":            onItem(ev.item); break;
+        case "remove":          onRemove(ev.id); break;
+        case "settings":        onSettings(ev.settings); break;
+        case "toast":           toast(ev.message, ev.kind || "info"); break;
+        case "openAdd":         openModal("addModal"); break;
+        case "windowState":     onWindowState(ev); break;
+        case "updateProgress":  onUpdateProgress(ev); break;
+        case "updateReady":     onUpdateReady(ev); break;
+        case "updateDismissed": onUpdateDismissed(); break;
       }
     } catch (e) { console.error("[matata] onEvent error", e); }
   }
@@ -292,6 +295,47 @@ function onRemove(id) {
 function onSettings(settings) {
   state.settings = settings || {};
   refreshMenuFromSettings();
+}
+
+// ---- update banner --------------------------------------------------
+
+function fmtBytes(n) {
+  if (!n || n < 0) return "0 B";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+}
+
+function onUpdateProgress(ev) {
+  const banner = $("updateBanner");
+  banner.hidden = false;
+  banner.classList.remove("ready");
+  $("ubActions").hidden = true;
+  $("ubTitle").textContent = "Downloading matata " + (ev.version || "");
+  const bytes = Number(ev.bytes) || 0;
+  const total = Number(ev.total) || 0;
+  let pct = 0;
+  if (total > 0) pct = Math.max(0, Math.min(100, (bytes / total) * 100));
+  $("ubProgressBar").style.width = pct.toFixed(1) + "%";
+  if (total > 0) {
+    $("ubMeta").textContent = pct.toFixed(0) + "% (" + fmtBytes(bytes) + " / " + fmtBytes(total) + ")";
+  } else {
+    $("ubMeta").textContent = fmtBytes(bytes) + " downloaded";
+  }
+}
+
+function onUpdateReady(ev) {
+  const banner = $("updateBanner");
+  banner.hidden = false;
+  banner.classList.add("ready");
+  $("ubTitle").textContent = "matata " + (ev.version || "") + " is ready to install";
+  $("ubProgressBar").style.width = "100%";
+  $("ubActions").hidden = false;
+}
+
+function onUpdateDismissed() {
+  $("updateBanner").hidden = true;
 }
 
 // ---- Downloads dropdown menu ---------------------------------------
@@ -786,6 +830,15 @@ document.addEventListener("DOMContentLoaded", () => {
   // Browser integration: hand the bundled signed XPI to firefox.exe.
   $("btnInstallFirefoxExt").addEventListener("click", () => {
     send({type: "installFirefoxExt"});
+  });
+
+  // Update banner buttons.
+  $("ubInstallNow").addEventListener("click", () => {
+    send({type: "installPendingUpdate"});
+  });
+  $("ubInstallLater").addEventListener("click", () => {
+    $("updateBanner").hidden = true;
+    send({type: "dismissUpdate"});
   });
 
   // Settings save

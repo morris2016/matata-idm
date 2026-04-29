@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.10",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.10/matata-0.9.9.10-setup.exe",
-  "notes": "- Auto-update now installs proactively when matata is idle, not only on quit\n  (the scheduler tick fires the staged installer once no downloads are running)\n- Firefox extension Settings button now opens the AMO listed page\n  (https://addons.mozilla.org/firefox/addon/matata-download-helper/) instead of\n  the bundled XPI -- AMO handles signing + auto-updates"
+  "version": "0.9.9.11",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.11/matata-0.9.9.11-setup.exe",
+  "notes": "- Recorda-style update banner: in-app progress strip while the new installer downloads\n- After download completes, banner shows 'Install now / Later' buttons\n- 'Install now' fires the silent installer immediately (matata closes, files swap, matata relaunches)\n- 'Later' keeps the staged file; install fires on next quit (WM_DESTROY backstop)\n- Removed the proactive scheduler-tick auto-install -- user explicitly chooses now"
 }

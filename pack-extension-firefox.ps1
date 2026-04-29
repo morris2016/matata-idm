@@ -68,7 +68,11 @@ $null  = New-Item -ItemType Directory -Path $stage
 
 $excludePatterns = @(
     "*.swp", "*.bak", "Thumbs.db", ".DS_Store", ".git", ".gitignore",
-    "STORE_LISTING.md", "LISTING_DESCRIPTION.md", "PRIVACY_TAB.md"
+    "STORE_LISTING.md", "LISTING_DESCRIPTION.md", "PRIVACY_TAB.md",
+    # The signed XPI is shipped by the matata installer, not packaged
+    # inside an AMO submission -- including it would self-nest and bloat
+    # the upload.
+    "*.xpi"
 )
 Get-ChildItem $extDir -Recurse -File | ForEach-Object {
     $skip = $false

@@ -758,3 +758,60 @@ input, textarea {
 }
 .site-login-row input { font-size: 12px; padding: 4px 8px; }
 .site-login-row .ic-btn { width: 28px; height: 28px; }
+
+/* ---- update banner (recorda-style) -------------------------------- */
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: linear-gradient(180deg, rgba(79,142,247,0.18), rgba(79,142,247,0.08));
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.update-banner[hidden] { display: none; }
+.update-banner .ub-icon {
+  width: 28px; height: 28px;
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(79,142,247,0.25);
+  border-radius: 6px;
+  color: var(--accent, #4f8ef7);
+}
+.update-banner .ub-icon svg { width: 16px; height: 16px; }
+.ub-body { flex: 1 1 auto; min-width: 0; }
+.ub-title {
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ub-progress-wrap {
+  height: 4px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.ub-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent, #4f8ef7);
+  border-radius: 2px;
+  transition: width 0.15s ease-out;
+}
+.ub-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.ub-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.ub-actions[hidden] { display: none; }
+.update-banner.ready .ub-progress-wrap { display: none; }
+.update-banner.ready .ub-meta { display: none; }
