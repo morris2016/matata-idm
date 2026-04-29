@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.9",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.9/matata-0.9.9.9-setup.exe",
-  "notes": "- Hardened single-instance enforcement: relaunching matata never spawns a second matata-gui.exe\n- Hidden tray instance is now reliably brought to the foreground via TOPMOST flicker\n- Race-resilient: second instance retries the FindWindow lookup for up to 2s if the first is still initializing"
+  "version": "0.9.9.10",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.10/matata-0.9.9.10-setup.exe",
+  "notes": "- Auto-update now installs proactively when matata is idle, not only on quit\n  (the scheduler tick fires the staged installer once no downloads are running)\n- Firefox extension Settings button now opens the AMO listed page\n  (https://addons.mozilla.org/firefox/addon/matata-download-helper/) instead of\n  the bundled XPI -- AMO handles signing + auto-updates"
 }

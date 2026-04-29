@@ -76,6 +76,12 @@ constexpr int IDI_MATATA_APPICON = 101;
 constexpr const wchar_t* kUpdateManifestUrl =
     L"https://morris2016.github.io/matata-idm/latest.json";
 
+// AMO listing for the Firefox extension. Used by the Settings "Get matata
+// for Firefox" button and the first-run trigger; AMO handles the install
+// prompt + signing + auto-updates from there.
+constexpr const wchar_t* kAmoListingUrl =
+    L"https://addons.mozilla.org/en-US/firefox/addon/matata-download-helper/";
+
 // ---- globals ---------------------------------------------------------
 
 HINSTANCE g_hInst   = nullptr;
@@ -1076,8 +1082,47 @@ void schedulerWorker() {
                                        g_settings.schedStartMinutes,
                                        g_settings.schedStopMinutes);
     }
+    int firstUpdateGraceTicks = 2;   // ~60s grace after launch before we
+                                     // consider firing a staged update.
     while (!g_schedExitFlag.load()) {
         schedTick(wasIn);
+
+        // Proactive auto-install: if the background updater staged an
+        // installer and matata is idle (no Running / Queued items) AND
+        // we're past the initial grace, fire it. The installer's
+        // /CLOSEAPPLICATIONS will close matata; /RESTARTAPPLICATIONS
+        // brings it back at the new version.
+        if (firstUpdateGraceTicks > 0) {
+            --firstUpdateGraceTicks;
+        } else {
+            bool havePending = false;
+            {
+                std::lock_guard<std::mutex> lk(g_pendingUpdateMu);
+                havePending = !g_pendingUpdateInstaller.empty();
+            }
+            if (havePending) {
+                bool busy = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_itemsMu);
+                    for (auto& it : g_items) {
+                        if (it->state == ItemState::Running ||
+                            it->state == ItemState::Queued) {
+                            busy = true; break;
+                        }
+                    }
+                }
+                if (!busy) {
+                    dbgLog(L"scheduler: idle + pending update -> auto-install now");
+                    runPendingInstaller();
+                    // runPendingInstaller is fire-and-forget; Inno will
+                    // /CLOSEAPPLICATIONS us within seconds. Either we
+                    // get killed or the install fails -- in the latter
+                    // case keep the file staged so a manual quit still
+                    // tries again.
+                }
+            }
+        }
+
         // Sleep in 1s slices so app shutdown isn't held up by the tick rate.
         for (int i = 0; i < 30 && !g_schedExitFlag.load(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2752,17 +2797,15 @@ void loadItemsFromDisk() {
 // Hands the bundled signed XPI to firefox.exe so Firefox shows its native
 // install confirmation. Returns true if Firefox was found and launched.
 //
-// verbose=true (Settings button): toasts on every outcome (success, no XPI,
-//   no Firefox -- in the last case also opens Explorer at the XPI so the
-//   user can drag it into a running Firefox).
-// verbose=false (first-run path): silent on failure so a user without
-//   Firefox isn't bothered.
+// Open the AMO listing for the matata Firefox extension. Prefers
+// firefox.exe so the install button on the AMO page works directly;
+// falls back to the user's default browser if Firefox isn't installed
+// (still useful: AMO renders an "Install Firefox" prompt then).
+//
+// verbose=true (Settings button): toast on every outcome.
+// verbose=false (first-run path): silent so a user without a browser
+// configuration isn't pestered.
 bool installFirefoxXpi(bool verbose) {
-    std::wstring xpi = exeDirEarly() + L"\\extension\\matata.xpi";
-    if (GetFileAttributesW(xpi.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        if (verbose) emitToast(L"matata.xpi not found next to matata-gui.exe", L"err");
-        return false;
-    }
     auto regPath = [](HKEY root, const wchar_t* sub, const wchar_t* val,
                       std::wstring& out) -> bool {
         HKEY hk;
@@ -2795,20 +2838,18 @@ bool installFirefoxXpi(bool verbose) {
             if (GetFileAttributesW(c) != INVALID_FILE_ATTRIBUTES) { firefox = c; break; }
         }
     }
-    if (firefox.empty()) {
-        if (verbose) {
-            std::wstring args = L"/select,\"" + xpi + L"\"";
-            ShellExecuteW(g_hwnd, L"open", L"explorer.exe",
-                          args.c_str(), nullptr, SW_SHOWNORMAL);
-            emitToast(L"Firefox not found. Drag matata.xpi from the opened folder into Firefox.", L"info");
-        }
-        return false;
+    if (!firefox.empty()) {
+        ShellExecuteW(g_hwnd, L"open", firefox.c_str(),
+                      kAmoListingUrl, nullptr, SW_SHOWNORMAL);
+        if (verbose) emitToast(L"Opening matata add-on page in Firefox", L"info");
+        return true;
     }
-    std::wstring quoted = L"\"" + xpi + L"\"";
-    ShellExecuteW(g_hwnd, L"open", firefox.c_str(),
-                  quoted.c_str(), nullptr, SW_SHOWNORMAL);
-    if (verbose) emitToast(L"Opening Firefox to install matata extension", L"info");
-    return true;
+    // Firefox not detected -- open AMO in the default browser as a fallback.
+    if (verbose) {
+        ShellExecuteW(g_hwnd, L"open", kAmoListingUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        emitToast(L"Firefox not detected. Opened the AMO page in your default browser.", L"info");
+    }
+    return false;
 }
 
 void handleMessage(const std::wstring& json) {
