@@ -13,7 +13,7 @@
 ;   - optionally adds a Start-Menu shortcut to matata-gui.exe
 
 #define MyAppName      "matata"
-#define MyAppVersion   "0.9.9.11"
+#define MyAppVersion   "0.9.9.12"
 #define MyAppPublisher "matata"
 #define MyAppURL       "https://matata.example/"
 #define MyAppExeName   "matata-gui.exe"
@@ -40,7 +40,7 @@ SetupIconFile=matata.ico
 ; replacing files. Without this, an upgrade silently skips files-in-use
 ; and the user keeps running the old build.
 CloseApplications=force
-CloseApplicationsFilter=*.exe,*.dll
+CloseApplicationsFilter=*.exe
 RestartApplications=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog

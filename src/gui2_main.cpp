@@ -935,9 +935,16 @@ void updateCheckWorker() {
     }
 }
 
-// Run the downloaded installer. /VERYSILENT runs without UI; CloseApplications
-// terminates the running matata so files can be replaced; RestartApplications
-// brings matata back up after the swap.
+// Forward decl: defined in the WebView2 setup section below.
+std::wstring exeDir();
+
+// Run the downloaded installer. /SILENT shows Inno's progress window (so the
+// user can see something is happening and any error dialogs surface);
+// CloseApplications terminates the running matata so files can be replaced;
+// RestartApplications brings matata back up after the swap. Before launch,
+// unregister matata_shell.dll so explorer.exe drops its handle -- otherwise
+// CloseApplicationsFilter=*.dll can't unload it and the .exe files get
+// queued for reboot replacement, which looks like a silent failure.
 void runPendingInstaller() {
     std::wstring path, ver;
     {
@@ -946,13 +953,55 @@ void runPendingInstaller() {
         ver  = g_pendingUpdateVersion;
     }
     if (path.empty()) return;
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        dbgLog(L"runPendingInstaller: staged file missing at %ls", path.c_str());
+        return;
+    }
+
+    // Best-effort: unregister the shell extension so explorer drops the DLL.
+    // Failure here is non-fatal -- the installer's CloseApplicationsFilter
+    // will still try to close it, just less reliably.
+    std::wstring shellDll = exeDir() + L"\\matata_shell.dll";
+    if (GetFileAttributesW(shellDll.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring rargs = L"/s /u \"" + shellDll + L"\"";
+        SHELLEXECUTEINFOW rsei{};
+        rsei.cbSize = sizeof(rsei);
+        rsei.fMask  = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        rsei.lpVerb = L"open";
+        rsei.lpFile = L"regsvr32.exe";
+        rsei.lpParameters = rargs.c_str();
+        rsei.nShow = SW_HIDE;
+        if (ShellExecuteExW(&rsei) && rsei.hProcess) {
+            WaitForSingleObject(rsei.hProcess, 5000);
+            CloseHandle(rsei.hProcess);
+        }
+        dbgLog(L"runPendingInstaller: unregistered shell ext (best-effort)");
+    }
+
     std::wstring args =
-        L"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS";
+        L"/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS";
     dbgLog(L"runPendingInstaller: launching %ls (v%ls)",
            path.c_str(), ver.c_str());
-    ShellExecuteW(nullptr, L"open", path.c_str(), args.c_str(),
-                  nullptr, SW_HIDE);
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask  = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"open";
+    sei.lpFile = path.c_str();
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        DWORD ec = GetLastError();
+        dbgLog(L"runPendingInstaller: ShellExecuteEx failed (err=%lu)", ec);
+        return;
+    }
+    if (sei.hProcess) {
+        // Don't wait for completion (Inno relaunches matata via
+        // /RESTARTAPPLICATIONS), but give the bootstrapper a moment to
+        // confirm it actually started before we move on.
+        WaitForSingleObject(sei.hProcess, 500);
+        CloseHandle(sei.hProcess);
+    }
 }
 
 void onUpdateAvailable(UpdateAvailMsg* m) {

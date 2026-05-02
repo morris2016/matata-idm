@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.11",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.11/matata-0.9.9.11-setup.exe",
-  "notes": "- Recorda-style update banner: in-app progress strip while the new installer downloads\n- After download completes, banner shows 'Install now / Later' buttons\n- 'Install now' fires the silent installer immediately (matata closes, files swap, matata relaunches)\n- 'Later' keeps the staged file; install fires on next quit (WM_DESTROY backstop)\n- Removed the proactive scheduler-tick auto-install -- user explicitly chooses now"
+  "version": "0.9.9.12",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.12/matata-0.9.9.12-setup.exe",
+  "notes": "- Fix silent-install failure: shell DLL is now unregistered before update so explorer drops its handle (was leaving .exe replacements queued for reboot)\n- Update installer now runs in /SILENT mode so Inno's progress window is visible during install\n- Better launch-failure logging via ShellExecuteEx + dbgLog\n- Drop *.dll from CloseApplicationsFilter (handled explicitly via regsvr32 /u)"
 }
