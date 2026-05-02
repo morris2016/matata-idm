@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "matata download helper",
   "short_name": "matata",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "description": "Send Chrome downloads to matata — fast segmented downloads with resume, HLS / DASH capture, and a clean queue.",
   "minimum_chrome_version": "109",
 

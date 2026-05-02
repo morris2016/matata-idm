@@ -345,6 +345,32 @@ function poll() {
   } catch {}
 }
 
+// Pull URLs out of any <video> / <source> elements on the page so we catch
+// videos the user never clicks "play" on (lazy-loaded players, autoplay-off
+// muted previews, etc.) and videos served without a recognisable URL extension
+// where the network request might use a generic /api/stream path.
+function scanDomMedia() {
+  const urls = new Set();
+  try {
+    const vids = document.querySelectorAll("video, audio");
+    for (const v of vids) {
+      if (v.currentSrc) urls.add(v.currentSrc);
+      if (v.src)        urls.add(v.src);
+      const sources = v.querySelectorAll("source");
+      for (const s of sources) {
+        if (s.src) urls.add(s.src);
+      }
+    }
+  } catch {}
+  if (!urls.size) return;
+  try {
+    chrome.runtime.sendMessage({
+      action: "report-dom-media",
+      urls:   Array.from(urls)
+    });
+  } catch {}
+}
+
 // Reset dismissed state on URL change so SPA navigation re-shows the overlay.
 let watchedUrl = location.href;
 setInterval(() => {
@@ -354,9 +380,11 @@ setInterval(() => {
     lastList = [];
     removeOverlay();
   }
+  scanDomMedia();
   poll();
 }, 1500);
 
+scanDomMedia();
 poll();
 
 })();

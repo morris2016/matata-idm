@@ -413,11 +413,34 @@ const MAX_PER_TAB = 20;
 // tabId -> [{url, referer, type, detectedAt}]
 const sniffed = new Map();
 
+// Progressive containers we recognise by URL extension. Segment-only formats
+// (.ts, .m4s) are deliberately excluded -- HLS/DASH manifests already cover
+// them and their per-segment requests would flood the per-tab list.
+const PROGRESSIVE_EXTS = {
+  ".mp4":  "mp4",
+  ".m4v":  "mp4",
+  ".webm": "webm",
+  ".mkv":  "mkv",
+  ".mov":  "mov",
+  ".avi":  "avi",
+  ".flv":  "flv",
+  ".ogv":  "ogv",
+  ".3gp":  "3gp",
+  ".wmv":  "wmv"
+};
+
+function extOf(path) {
+  const dot = path.lastIndexOf(".");
+  return dot >= 0 ? path.slice(dot) : "";
+}
+
 function mediaTypeOf(url) {
   try {
     const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return "";
     const p = u.pathname.toLowerCase();
     const h = u.hostname.toLowerCase();
+    // -- HLS / DASH manifests -----------------------------------------
     if (p.endsWith(".m3u8") || p.includes(".m3u8?")) return "hls";
     if (p.endsWith(".mpd")  || p.includes(".mpd?"))  return "dash";
     // Vimeo's master.json playlist.
@@ -425,8 +448,61 @@ function mediaTypeOf(url) {
     if (h.endsWith("vimeocdn.com")  && /master\.json/.test(p)) return "dash";
     // Bare HLS playlist names some CDNs use.
     if (/\/(playlist|index|chunklist|master)\.m3u8/.test(p))   return "hls";
+    // -- Microsoft Smooth Streaming -----------------------------------
+    if (/\.ism(?:\/manifest)?\b/.test(p))  return "smooth";
+    if (/\/manifest$/.test(p))             return "smooth";
+    // -- Progressive media files --------------------------------------
+    // Try the basename's extension (handles ?query suffixes).
+    const base = p.split(/[?#]/)[0];
+    const ext  = extOf(base);
+    if (ext && PROGRESSIVE_EXTS[ext]) return PROGRESSIVE_EXTS[ext];
   } catch {}
   return "";
+}
+
+// Maps a Content-Type response header to a sniff bucket. Used by the
+// onHeadersReceived listener to catch HLS/DASH/progressive responses
+// served from URLs that don't carry a recognisable extension.
+const CONTENT_TYPE_MAP = {
+  "application/vnd.apple.mpegurl":  "hls",
+  "application/x-mpegurl":          "hls",
+  "audio/mpegurl":                  "hls",   // some servers misname it
+  "audio/x-mpegurl":                "hls",
+  "application/dash+xml":           "dash",
+  "video/vnd.mpeg.dash.mpd":        "dash",
+  "video/mp4":                      "mp4",
+  "video/x-m4v":                    "mp4",
+  "video/webm":                     "webm",
+  "video/x-matroska":               "mkv",
+  "video/quicktime":                "mov",
+  "video/x-msvideo":                "avi",
+  "video/x-flv":                    "flv",
+  "video/ogg":                      "ogv",
+  "video/3gpp":                     "3gp",
+  "video/x-ms-wmv":                 "wmv"
+};
+
+// Tiny progressive responses are almost always thumbnails / previews /
+// adverts -- skip anything below this length to keep the badge clean.
+const MIN_PROGRESSIVE_BYTES = 262144; // 256 KB
+
+function bucketIsProgressive(t) {
+  return t && t !== "hls" && t !== "dash" && t !== "smooth";
+}
+
+function findHeader(headers, name) {
+  if (!headers) return "";
+  const lname = name.toLowerCase();
+  for (const h of headers) {
+    if (h.name && h.name.toLowerCase() === lname) return String(h.value || "");
+  }
+  return "";
+}
+
+function typeFromContentType(ct) {
+  if (!ct) return "";
+  const main = ct.split(";")[0].trim().toLowerCase();
+  return CONTENT_TYPE_MAP[main] || "";
 }
 
 function pushSniffed(tabId, entry) {
@@ -456,6 +532,35 @@ chrome.webRequest.onBeforeRequest.addListener(
     });
   },
   { urls: ["<all_urls>"] }
+);
+
+// Header-based fallback. Catches HLS/DASH/progressive responses whose URL
+// gives no clue (e.g. /api/stream?id=…). Progressive responses are gated by
+// Content-Length so we don't badge thumbnails or 1-second ad clips.
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (!details || !details.responseHeaders) return;
+    // Skip if the URL-pass already classified this exact request.
+    if (mediaTypeOf(details.url)) return;
+    const ct = findHeader(details.responseHeaders, "content-type");
+    const t  = typeFromContentType(ct);
+    if (!t) return;
+    if (bucketIsProgressive(t)) {
+      const lenStr = findHeader(details.responseHeaders, "content-length");
+      const len    = lenStr ? parseInt(lenStr, 10) : 0;
+      // No length header at all -- chunked transfer; allow it through.
+      // Has a length but is tiny -- skip.
+      if (len > 0 && len < MIN_PROGRESSIVE_BYTES) return;
+    }
+    pushSniffed(details.tabId, {
+      url: details.url,
+      type: t,
+      referer: details.initiator || details.documentUrl || "",
+      detectedAt: Date.now()
+    });
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"]
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -556,6 +661,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     })();
     return true; // async response
+  }
+  if (msg && msg.action === "report-dom-media" && Array.isArray(msg.urls)) {
+    // Content-script reports URLs scraped from <video src=…> / <source src=…>
+    // / video.currentSrc. These often resolve before the network request fires
+    // (or the user never hits play), so we synthesise sniffed entries from the
+    // DOM and let the overlay surface them anyway.
+    const senderTabId = sender && sender.tab && sender.tab.id;
+    const ref = (sender && sender.tab && sender.tab.url) || "";
+    if (senderTabId !== undefined && senderTabId >= 0) {
+      for (const raw of msg.urls) {
+        if (!raw || typeof raw !== "string") continue;
+        if (raw.startsWith("blob:") || raw.startsWith("data:")) continue;
+        const t = mediaTypeOf(raw);
+        if (!t) continue;
+        pushSniffed(senderTabId, {
+          url: raw,
+          type: t,
+          referer: ref,
+          detectedAt: Date.now(),
+          source: "dom"
+        });
+      }
+    }
+    sendResponse({ ok: true });
+    return true;
   }
   if (msg && msg.action === "list-sniffed") {
     // Prefer the sender tab when this comes from a content script, fall back

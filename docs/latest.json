@@ -1,5 +1,5 @@
 {
-  "version": "0.9.9.12",
-  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.12/matata-0.9.9.12-setup.exe",
-  "notes": "- Fix silent-install failure: shell DLL is now unregistered before update so explorer drops its handle (was leaving .exe replacements queued for reboot)\n- Update installer now runs in /SILENT mode so Inno's progress window is visible during install\n- Better launch-failure logging via ShellExecuteEx + dbgLog\n- Drop *.dll from CloseApplicationsFilter (handled explicitly via regsvr32 /u)"
+  "version": "0.9.9.13",
+  "url": "https://github.com/morris2016/matata-idm/releases/download/v0.9.9.13/matata-0.9.9.13-setup.exe",
+  "notes": "- Detect progressive video files (mp4, m4v, webm, mkv, mov, avi, flv, ogv, 3gp, wmv) -- previously only HLS/DASH manifests were sniffed\n- Detect HLS/DASH/progressive responses by Content-Type header (catches streams served from URLs without a recognisable extension)\n- Detect Microsoft Smooth Streaming (.ism/Manifest)\n- Scan the DOM for <video> / <source> srcs so videos the user never clicks play on are still surfaced\n- Tiny progressive responses (< 256 KB) are filtered out so thumbnails / preview clips don't pollute the badge\n- Segment-only formats (.ts, .m4s) and blob:/data: URLs are skipped"
 }
